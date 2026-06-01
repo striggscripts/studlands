@@ -7,7 +7,6 @@ local UIS = game:GetService("UserInputService")
 local runService = game:GetService("RunService")
 
 -- State flags
-local toolEquipped = false
 local autoTeleporting = false
 local autoWoodEnabled = false
 local autoKilling = false
@@ -89,51 +88,28 @@ local function showNotification(txt)
     })
 end
 
-local function updateToolStatus()
-    toolEquipped = false
-    local tool = char:FindFirstChildOfClass("Tool")
-    if tool then
-        local nm = tool.Name:lower()
-        if autoTeleporting and nm:find("pickaxe") then toolEquipped = true end
-        if autoWoodEnabled and nm:find("axe") then toolEquipped = true end
-        if autoKilling and (nm:find("sword") or nm:find("cleaver")) then toolEquipped = true end
-    end
-end
-
-local function teleportAndSwing(model, offset, keyword)
-    if not model.PrimaryPart then
-        model.PrimaryPart = model:FindFirstChildWhichIsA("BasePart")
-        if not model.PrimaryPart then return end
+-- Nieuwe functie: Automatisch de juiste tool pakken uit je inventory
+local function equipTool(keyword)
+    local currentTool = char:FindFirstChildOfClass("Tool")
+    if currentTool and currentTool.Name:lower():find(keyword) then
+        return currentTool
     end
     
-    local targetPos = (model.PrimaryPart.CFrame * offset).p
-    if (hrp.Position - targetPos).Magnitude > 0.5 then
-        hrp.CFrame = CFrame.new(targetPos)
-    end
-    
-    task.wait(0.15)
-    
-    local tool = char:FindFirstChildOfClass("Tool")
-    if tool and tool.Name:lower():find(keyword) then
-        -- Controleer of de remote event daadwerkelijk bestaat voor veiligheid
-        local remote = workspace:FindFirstChild("Remotes") and workspace.Remotes:FindFirstChild("UseItem")
-        if remote then
-            remote:FireServer(tool, false)
+    for _, item in ipairs(player.Backpack:GetChildren()) do
+        if item:IsA("Tool") and item.Name:lower():find(keyword) then
+            humanoid:EquipTool(item)
+            return item
         end
     end
+    return nil
 end
 
 local function removeCooldown(tool)
     if not noCooldownEnabled then return end
-    local deb = tool:FindFirstChild("Cooldown")
-             or tool:FindFirstChild("AttackCooldown")
-             or tool:FindFirstChild("AttackDebounce")
+    local deb = tool:FindFirstChild("Cooldown") or tool:FindFirstChild("AttackCooldown") or tool:FindFirstChild("AttackDebounce")
     if deb and deb:IsA("NumberValue") then
         deb.Value = 0
-        -- Voorkom geheugenlekken met een simpele update
-        deb.Changed:Connect(function() 
-            if noCooldownEnabled then deb.Value = 0 end 
-        end)
+        deb.Changed:Connect(function() if noCooldownEnabled then deb.Value = 0 end end)
     end
 end
 
@@ -155,9 +131,325 @@ end)
 hookCharacter(char)
 
 --------------------------------------------------------------------------------
--- Unified Autofarm Loop (Performance boost)
+-- SLIMME MASTER AUTOFARM LOOP
 --------------------------------------------------------------------------------
 task.spawn(function()
-    while task.wait(0.5) do
+    while task.wait(0.1) do
         if autoTeleporting or autoWoodEnabled or autoKilling then
-            updateToolStatus()
+            
+            local targetDict = {}
+            local toolKeyword = ""
+            local offset = CFrame.new(0, 3, 0)
+            
+            if autoTeleporting then
+                targetDict = selectedOres
+                toolKeyword = "pickaxe"
+            elseif autoWoodEnabled then
+                targetDict = selectedWood
+                toolKeyword = "axe"
+                offset = CFrame.new(0, 4, 0)
+            elseif autoKilling then
+                targetDict = selectedEnemies
+                toolKeyword = "sword" 
+                offset = CFrame.new(0, 4, 0)
+            end
+            
+            -- Automatisch tool equippen (zoekt ook naar cleaver als sword faalt)
+            local myTool = equipTool(toolKeyword)
+            if not myTool and toolKeyword == "sword" then
+                myTool = equipTool("cleaver")
+            end
+            
+            if not myTool then
+                showNotification("Geen " .. toolKeyword .. " in inventory gevonden!")
+                task.wait(2)
+                continue
+            end
+            
+            -- Zoek het DICHTSTBIJZIJNDE doelwit
+            local closestTarget = nil
+            local shortestDist = math.huge
+            
+            for _, m in ipairs(workspace:GetDescendants()) do
+                if m:IsA("Model") and targetDict[m.Name] and m.PrimaryPart then
+                    
+                    -- Check of het wel leeft (bij enemies)
+                    if autoKilling then
+                        local eHum = m:FindFirstChild("Humanoid")
+                        if not eHum or eHum.Health <= 0 then continue end
+                    end
+                    
+                    local dist = (hrp.Position - m.PrimaryPart.Position).Magnitude
+                    if dist < shortestDist then
+                        shortestDist = dist
+                        closestTarget = m
+                    end
+                end
+            end
+            
+            -- Val aan / Hak
+            if closestTarget and closestTarget.PrimaryPart then
+                local stuckTimer = 0 -- Voorkomt oneindig vastzitten
+                
+                repeat
+                    task.wait(0.15)
+                    stuckTimer += 0.15
+                    
+                    if hrp and closestTarget.PrimaryPart then
+                        hrp.CFrame = closestTarget.PrimaryPart.CFrame * offset
+                    end
+                    
+                    if myTool then
+                        local remote = workspace:FindFirstChild("Remotes") and workspace.Remotes:FindFirstChild("UseItem")
+                        if remote then
+                            remote:FireServer(myTool, false)
+                        else
+                            myTool:Activate() -- Fallback als remote niet werkt
+                        end
+                    end
+                    
+                    -- Check of doelwit dood/vernietigd is
+                    local isAlive = true
+                    if autoKilling then
+                        local h = closestTarget:FindFirstChild("Humanoid")
+                        if not h or h.Health <= 0 then isAlive = false end
+                    else
+                        if not closestTarget.Parent or not closestTarget.PrimaryPart then isAlive = false end
+                    end
+                    
+                until not isAlive or stuckTimer > 10 or not (autoTeleporting or autoWoodEnabled or autoKilling)
+            end
+        end
+    end
+end)
+
+--------------------------------------------------------------------------------
+-- LAG VRIJE ESP LOOP (Alleen levende enemies)
+--------------------------------------------------------------------------------
+task.spawn(function()
+    while task.wait(1) do -- 1x per seconde is genoeg, scheelt veel lag
+        if mobESPEnabled then
+            for _, m in ipairs(workspace:GetDescendants()) do
+                if m:IsA("Model") and table.find(mobs, m.Name) then
+                    local hum = m:FindFirstChild("Humanoid")
+                    if hum and hum.Health > 0 then
+                        -- Check of hij al een highlight heeft
+                        if not m:FindFirstChild("ESPHighlight") then
+                            local hl = Instance.new("Highlight")
+                            hl.Name = "ESPHighlight"
+                            hl.FillColor = Color3.fromRGB(255, 0, 0) -- Rood
+                            hl.OutlineColor = Color3.fromRGB(255, 255, 255)
+                            hl.FillTransparency = 0.5
+                            hl.Parent = m
+                        end
+                    elseif hum and hum.Health <= 0 then
+                        -- Haal highlight weg als hij dood is
+                        local hl = m:FindFirstChild("ESPHighlight")
+                        if hl then hl:Destroy() end
+                    end
+                end
+            end
+        end
+    end
+end)
+
+--------------------------------------------------------------------------------
+-- UI Tabs Setup
+local TabInfo = Window:CreateTab("Info")
+local TabAutoTP = Window:CreateTab("Auto TP")
+local TabTeleports = Window:CreateTab("Teleports")
+local TabCombat = Window:CreateTab("Combat & Kill")
+local TabWood = Window:CreateTab("Auto Wood")
+local TabExtras = Window:CreateTab("Extras")
+local TabESP = Window:CreateTab("Mob ESP")
+
+-- Tab 1: Info
+TabInfo:CreateParagraph({Title = "Status", Content = "Script geoptimaliseerd: Anti-Lag, Auto-Equip en Smart Targeting toegevoegd."})
+
+-- Tab 2: Auto TP (Ores)
+TabAutoTP:CreateSection("Ore Teleporting")
+for _, ore in ipairs(ores) do
+    TabAutoTP:CreateToggle({
+        Name = "Farm " .. ore,
+        CurrentValue = false,
+        Flag = "AutoTP_" .. ore,
+        Callback = function(Value)
+            if Value then
+                selectedOres[ore] = true
+                autoTeleporting = true
+                autoWoodEnabled = false
+                autoKilling = false
+            else
+                selectedOres[ore] = nil
+                autoTeleporting = next(selectedOres) ~= nil
+            end
+        end,
+    })
+end
+
+-- Tab 3: Teleports
+TabTeleports:CreateSection("Locations")
+for _, v in ipairs(tpList) do
+    TabTeleports:CreateButton({
+        Name = v[1],
+        Callback = function()
+            hrp.Anchored = true
+            hrp.CFrame = CFrame.new(v[2])
+            task.wait(0.3)
+            hrp.Anchored = false
+        end,
+    })
+end
+
+TabTeleports:CreateSection("Bosses")
+for _, v in ipairs(bossesTP) do
+    TabTeleports:CreateButton({
+        Name = v[1],
+        Callback = function()
+            hrp.Anchored = true
+            hrp.CFrame = CFrame.new(v[2])
+            task.wait(0.3)
+            hrp.Anchored = false
+        end,
+    })
+end
+
+-- Tab 4: Combat (No Cooldown & Auto Kill)
+TabCombat:CreateSection("Modifiers")
+TabCombat:CreateToggle({
+    Name = "No Cooldown",
+    CurrentValue = false,
+    Flag = "NoCooldown",
+    Callback = function(Value)
+        noCooldownEnabled = Value
+        hookCharacter(char)
+    end,
+})
+
+TabCombat:CreateSection("Auto Kill Targets")
+local allEnemies = {}
+for _, v in ipairs(mobs) do table.insert(allEnemies, v) end
+for _, v in ipairs(bosses) do table.insert(allEnemies, v) end
+
+for _, name in ipairs(allEnemies) do
+    TabCombat:CreateToggle({
+        Name = "Kill " .. name,
+        CurrentValue = false,
+        Flag = "AutoKill_" .. name,
+        Callback = function(Value)
+            if Value then
+                selectedEnemies[name] = true
+                autoTeleporting = false
+                autoWoodEnabled = false
+                autoKilling = true
+            else
+                selectedEnemies[name] = nil
+                autoKilling = next(selectedEnemies) ~= nil
+            end
+        end,
+    })
+end
+
+-- Tab 5: Auto Wood
+TabWood:CreateSection("Wood Farming")
+for _, w in ipairs(woodStumps) do
+    TabWood:CreateToggle({
+        Name = w,
+        CurrentValue = false,
+        Flag = "AutoWood_" .. w,
+        Callback = function(Value)
+            if Value then
+                selectedWood[w] = true
+                autoWoodEnabled = true
+                autoTeleporting = false
+                autoKilling = false
+            else
+                selectedWood[w] = nil
+                autoWoodEnabled = next(selectedWood) ~= nil
+            end
+        end,
+    })
+end
+
+-- Tab 6: Extras
+TabExtras:CreateSection("Character Mods")
+TabExtras:CreateSlider({
+    Name = "WalkSpeed",
+    Range = {16, 100},
+    Increment = 1,
+    CurrentValue = 16,
+    Flag = "SliderWS",
+    Callback = function(Value)
+        humanoid.WalkSpeed = Value
+    end,
+})
+
+TabExtras:CreateSlider({
+    Name = "JumpPower",
+    Range = {50, 200},
+    Increment = 1,
+    CurrentValue = 50,
+    Flag = "SliderJP",
+    Callback = function(Value)
+        humanoid.JumpPower = Value
+    end,
+})
+
+TabExtras:CreateToggle({
+    Name = "Semi-God Mode",
+    CurrentValue = false,
+    Flag = "SemiGod",
+    Callback = function(Value)
+        semiGodEnabled = Value
+    end,
+})
+
+humanoid.HealthChanged:Connect(function(hp)
+    if semiGodEnabled and autoKilling and hp > 0 and hp < 30 then
+        returnPosition = hrp.CFrame
+        showNotification("Health low! Terugtrekken...")
+        hrp.CFrame = CFrame.new(-564, -315, -1093)
+
+        repeat task.wait(1) until humanoid.Health >= humanoid.MaxHealth
+
+        showNotification("Genezingsproces voltooid! Terugkeren...")
+        if returnPosition then
+            hrp.CFrame = returnPosition
+        end
+    end
+end)
+
+TabExtras:CreateToggle({
+    Name = "Infinite Jump",
+    CurrentValue = false,
+    Flag = "InfJump",
+    Callback = function(Value)
+        infiniteJumpEnabled = Value
+    end,
+})
+
+UIS.JumpRequest:Connect(function()
+    if infiniteJumpEnabled and humanoid and humanoid.Health > 0 then
+        humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+    end
+end)
+
+-- Tab 7: Mob ESP
+TabESP:CreateSection("Visuals")
+TabESP:CreateToggle({
+    Name = "Highlight Mobs",
+    CurrentValue = false,
+    Flag = "MobESP",
+    Callback = function(Value)
+        mobESPEnabled = Value
+        if not Value then
+            -- Clean-up als we het uitschakelen
+            for _, m in ipairs(workspace:GetDescendants()) do
+                if m:IsA("Model") then
+                    local hl = m:FindFirstChild("ESPHighlight")
+                    if hl then hl:Destroy() end
+                end
+            end
+        end
+    end,
+})

@@ -7,7 +7,6 @@ local UIS = game:GetService("UserInputService")
 local runService = game:GetService("RunService")
 
 -- State flags
-local toolEquipped = false
 local autoTeleporting = false
 local autoWoodEnabled = false
 local autoKilling = false
@@ -20,8 +19,6 @@ local selectedOres = {}
 local selectedWood = {}
 local selectedEnemies = {}
 local returnPosition = nil
-
-local originalColors = {}
 
 -- Content lists
 local ores = {
@@ -75,10 +72,8 @@ local Rayfield = loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
 local Window = Rayfield:CreateWindow({
     Name = "Ore Teleporter & Autofarm",
     LoadingTitle = "Loading Script...",
-    LoadingSubtitle = "by You",
-    ConfigurationSaving = {
-        Enabled = false
-    },
+    LoadingSubtitle = "Geoptimaliseerd",
+    ConfigurationSaving = { Enabled = false },
     KeySystem = false
 })
 
@@ -86,45 +81,32 @@ local Window = Rayfield:CreateWindow({
 -- Utility Functions
 local function showNotification(txt)
     Rayfield:Notify({
-        Title = "System Notification",
+        Title = "Systeem Melding",
         Content = txt,
         Duration = 3,
         Image = 4483362458
     })
 end
 
-local function updateToolStatus()
-    toolEquipped = false
-    local tool = char:FindFirstChildOfClass("Tool")
-    if tool then
-        local nm = tool.Name:lower()
-        if autoTeleporting and nm:find("pickaxe") then toolEquipped = true end
-        if autoWoodEnabled and nm:find("axe") then toolEquipped = true end
-        if autoKilling and (nm:find("sword") or nm:find("cleaver")) then toolEquipped = true end
+-- Nieuwe functie: Automatisch de juiste tool pakken uit je inventory
+local function equipTool(keyword)
+    local currentTool = char:FindFirstChildOfClass("Tool")
+    if currentTool and currentTool.Name:lower():find(keyword) then
+        return currentTool
     end
-end
-
-local function teleportAndSwing(model, offset, keyword)
-    if not model.PrimaryPart then
-        model.PrimaryPart = model:FindFirstChildWhichIsA("BasePart")
-        if not model.PrimaryPart then return end
+    
+    for _, item in ipairs(player.Backpack:GetChildren()) do
+        if item:IsA("Tool") and item.Name:lower():find(keyword) then
+            humanoid:EquipTool(item)
+            return item
+        end
     end
-    local targetPos = (model.PrimaryPart.CFrame * offset).p
-    if (hrp.Position - targetPos).Magnitude > 0.5 then
-        hrp.CFrame = CFrame.new(targetPos)
-    end
-    task.wait(0.15)
-    local tool = char:FindFirstChildOfClass("Tool")
-    if tool and tool.Name:lower():find(keyword) then
-        workspace.Remotes.UseItem:FireServer(tool, false)
-    end
+    return nil
 end
 
 local function removeCooldown(tool)
     if not noCooldownEnabled then return end
-    local deb = tool:FindFirstChild("Cooldown")
-             or tool:FindFirstChild("AttackCooldown")
-             or tool:FindFirstChild("AttackDebounce")
+    local deb = tool:FindFirstChild("Cooldown") or tool:FindFirstChild("AttackCooldown") or tool:FindFirstChild("AttackDebounce")
     if deb and deb:IsA("NumberValue") then
         deb.Value = 0
         deb.Changed:Connect(function() if noCooldownEnabled then deb.Value = 0 end end)
@@ -149,6 +131,129 @@ end)
 hookCharacter(char)
 
 --------------------------------------------------------------------------------
+-- SLIMME MASTER AUTOFARM LOOP
+--------------------------------------------------------------------------------
+task.spawn(function()
+    while task.wait(0.1) do
+        if autoTeleporting or autoWoodEnabled or autoKilling then
+            
+            local targetDict = {}
+            local toolKeyword = ""
+            local offset = CFrame.new(0, 3, 0)
+            
+            if autoTeleporting then
+                targetDict = selectedOres
+                toolKeyword = "pickaxe"
+            elseif autoWoodEnabled then
+                targetDict = selectedWood
+                toolKeyword = "axe"
+                offset = CFrame.new(0, 4, 0)
+            elseif autoKilling then
+                targetDict = selectedEnemies
+                toolKeyword = "sword" 
+                offset = CFrame.new(0, 4, 0)
+            end
+            
+            -- Automatisch tool equippen (zoekt ook naar cleaver als sword faalt)
+            local myTool = equipTool(toolKeyword)
+            if not myTool and toolKeyword == "sword" then
+                myTool = equipTool("cleaver")
+            end
+            
+            if not myTool then
+                showNotification("Geen " .. toolKeyword .. " in inventory gevonden!")
+                task.wait(2)
+                continue
+            end
+            
+            -- Zoek het DICHTSTBIJZIJNDE doelwit
+            local closestTarget = nil
+            local shortestDist = math.huge
+            
+            for _, m in ipairs(workspace:GetDescendants()) do
+                if m:IsA("Model") and targetDict[m.Name] and m.PrimaryPart then
+                    
+                    -- Check of het wel leeft (bij enemies)
+                    if autoKilling then
+                        local eHum = m:FindFirstChild("Humanoid")
+                        if not eHum or eHum.Health <= 0 then continue end
+                    end
+                    
+                    local dist = (hrp.Position - m.PrimaryPart.Position).Magnitude
+                    if dist < shortestDist then
+                        shortestDist = dist
+                        closestTarget = m
+                    end
+                end
+            end
+            
+            -- Val aan / Hak
+            if closestTarget and closestTarget.PrimaryPart then
+                local stuckTimer = 0 -- Voorkomt oneindig vastzitten
+                
+                repeat
+                    task.wait(0.15)
+                    stuckTimer += 0.15
+                    
+                    if hrp and closestTarget.PrimaryPart then
+                        hrp.CFrame = closestTarget.PrimaryPart.CFrame * offset
+                    end
+                    
+                    if myTool then
+                        local remote = workspace:FindFirstChild("Remotes") and workspace.Remotes:FindFirstChild("UseItem")
+                        if remote then
+                            remote:FireServer(myTool, false)
+                        else
+                            myTool:Activate() -- Fallback als remote niet werkt
+                        end
+                    end
+                    
+                    -- Check of doelwit dood/vernietigd is
+                    local isAlive = true
+                    if autoKilling then
+                        local h = closestTarget:FindFirstChild("Humanoid")
+                        if not h or h.Health <= 0 then isAlive = false end
+                    else
+                        if not closestTarget.Parent or not closestTarget.PrimaryPart then isAlive = false end
+                    end
+                    
+                until not isAlive or stuckTimer > 10 or not (autoTeleporting or autoWoodEnabled or autoKilling)
+            end
+        end
+    end
+end)
+
+--------------------------------------------------------------------------------
+-- LAG VRIJE ESP LOOP (Alleen levende enemies)
+--------------------------------------------------------------------------------
+task.spawn(function()
+    while task.wait(1) do -- 1x per seconde is genoeg, scheelt veel lag
+        if mobESPEnabled then
+            for _, m in ipairs(workspace:GetDescendants()) do
+                if m:IsA("Model") and table.find(mobs, m.Name) then
+                    local hum = m:FindFirstChild("Humanoid")
+                    if hum and hum.Health > 0 then
+                        -- Check of hij al een highlight heeft
+                        if not m:FindFirstChild("ESPHighlight") then
+                            local hl = Instance.new("Highlight")
+                            hl.Name = "ESPHighlight"
+                            hl.FillColor = Color3.fromRGB(255, 0, 0) -- Rood
+                            hl.OutlineColor = Color3.fromRGB(255, 255, 255)
+                            hl.FillTransparency = 0.5
+                            hl.Parent = m
+                        end
+                    elseif hum and hum.Health <= 0 then
+                        -- Haal highlight weg als hij dood is
+                        local hl = m:FindFirstChild("ESPHighlight")
+                        if hl then hl:Destroy() end
+                    end
+                end
+            end
+        end
+    end
+end)
+
+--------------------------------------------------------------------------------
 -- UI Tabs Setup
 local TabInfo = Window:CreateTab("Info")
 local TabAutoTP = Window:CreateTab("Auto TP")
@@ -159,9 +264,9 @@ local TabExtras = Window:CreateTab("Extras")
 local TabESP = Window:CreateTab("Mob ESP")
 
 -- Tab 1: Info
-TabInfo:CreateParagraph({Title = "Information", Content = "Script successfully ported to Rayfield UI."})
+TabInfo:CreateParagraph({Title = "Status", Content = "Script geoptimaliseerd: Anti-Lag, Auto-Equip en Smart Targeting toegevoegd."})
 
--- Tab 2: Auto TP
+-- Tab 2: Auto TP (Ores)
 TabAutoTP:CreateSection("Ore Teleporting")
 for _, ore in ipairs(ores) do
     TabAutoTP:CreateToggle({
@@ -181,27 +286,6 @@ for _, ore in ipairs(ores) do
         end,
     })
 end
-
-spawn(function()
-    while true do
-        if autoTeleporting and next(selectedOres) then
-            updateToolStatus()
-            if not toolEquipped then
-                showNotification("Equip a pickaxe!")
-            else
-                for _, m in ipairs(workspace:GetDescendants()) do
-                    if m:IsA("Model") and selectedOres[m.Name] and m.PrimaryPart then
-                        repeat
-                            teleportAndSwing(m, CFrame.new(0,3,0), "pickaxe")
-                            task.wait(0.5)
-                        until not m.Parent or not autoTeleporting
-                    end
-                end
-            end
-        end
-        task.wait(5)
-    end
-end)
 
 -- Tab 3: Teleports
 TabTeleports:CreateSection("Locations")
@@ -266,28 +350,6 @@ for _, name in ipairs(allEnemies) do
     })
 end
 
-spawn(function()
-    while true do
-        if autoKilling and next(selectedEnemies) then
-            updateToolStatus()
-            if not toolEquipped then
-                showNotification("Equip a sword!")
-            else
-                local found = false
-                for _, m in ipairs(workspace:GetDescendants()) do
-                    if m:IsA("Model") and selectedEnemies[m.Name] and m.PrimaryPart then
-                        found = true
-                        teleportAndSwing(m, CFrame.new(0,4,0), "sword")
-                        task.wait(0.2)
-                    end
-                end
-                if not found then task.wait(1) end
-            end
-        end
-        task.wait(5)
-    end
-end)
-
 -- Tab 5: Auto Wood
 TabWood:CreateSection("Wood Farming")
 for _, w in ipairs(woodStumps) do
@@ -308,27 +370,6 @@ for _, w in ipairs(woodStumps) do
         end,
     })
 end
-
-spawn(function()
-    while true do
-        if autoWoodEnabled and next(selectedWood) then
-            updateToolStatus()
-            if not toolEquipped then
-                showNotification("Equip an axe!")
-            else
-                for _, m in ipairs(workspace:GetDescendants()) do
-                    if m:IsA("Model") and selectedWood[m.Name] and m.PrimaryPart then
-                        repeat
-                            teleportAndSwing(m, CFrame.new(0,4,0), "axe")
-                            task.wait(0.5)
-                        until not m.Parent or not autoWoodEnabled
-                    end
-                end
-            end
-        end
-        task.wait(5)
-    end
-end)
 
 -- Tab 6: Extras
 TabExtras:CreateSection("Character Mods")
@@ -360,27 +401,21 @@ TabExtras:CreateToggle({
     Flag = "SemiGod",
     Callback = function(Value)
         semiGodEnabled = Value
-        if Value then
-            showNotification("Semi-God enabled")
-        else
-            showNotification("Semi-God disabled")
-        end
     end,
 })
 
 humanoid.HealthChanged:Connect(function(hp)
     if semiGodEnabled and autoKilling and hp > 0 and hp < 30 then
         returnPosition = hrp.CFrame
-        showNotification("Health low! Retreating home")
+        showNotification("Health low! Terugtrekken...")
         hrp.CFrame = CFrame.new(-564, -315, -1093)
 
         repeat task.wait(1) until humanoid.Health >= humanoid.MaxHealth
 
-        showNotification("Healed! Returning...")
+        showNotification("Genezingsproces voltooid! Terugkeren...")
         if returnPosition then
             hrp.CFrame = returnPosition
         end
-        showNotification("Resuming Auto-Kill")
     end
 end)
 
@@ -408,27 +443,13 @@ TabESP:CreateToggle({
     Callback = function(Value)
         mobESPEnabled = Value
         if not Value then
-            for part, color in pairs(originalColors) do
-                if part and part.Parent then part.Color = color end
-            end
-            originalColors = {}
-        end
-    end,
-})
-
-runService.Heartbeat:Connect(function()
-    if mobESPEnabled then
-        for _, m in ipairs(workspace:GetDescendants()) do
-            if m:IsA("Model") and table.find(mobs, m.Name) then
-                for _, part in ipairs(m:GetDescendants()) do
-                    if part:IsA("BasePart") then
-                        if not originalColors[part] then
-                            originalColors[part] = part.Color
-                        end
-                        part.Color = Color3.fromRGB(0, 255, 0)
-                    end
+            -- Clean-up als we het uitschakelen
+            for _, m in ipairs(workspace:GetDescendants()) do
+                if m:IsA("Model") then
+                    local hl = m:FindFirstChild("ESPHighlight")
+                    if hl then hl:Destroy() end
                 end
             end
         end
-    end
-end)
+    end,
+})

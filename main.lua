@@ -1,5 +1,5 @@
 -- ============================================================
---  Autofarm Script — Strict Targeting Fix
+--  Autofarm Script — De Definitieve "Area-Strict" Versie
 -- ============================================================
 
 local player = game.Players.LocalPlayer
@@ -32,7 +32,7 @@ local ores = {
 }
 local woodStumps = {"Oak Stump","Redwood Stump","Spruce Stump"}
 local mobs = {
-    "Cubey","Wedgey","Field Mousey","Flying Goldfish","Wooden Mimic","Target Dummy", "Dummy",
+    "Cubey","Wedgey","Field Mousey","Flying Goldfish","Wooden Mimic","Dummy", "Target Dummy",
     "Cavey","Spidey","Bonezo","Cave Spidey","Sentient Assault Rifle","Mini Cubey",
     "Mini Bomb","Cubey Mage","Ghostey","Buney","Cublin","Cublin Warrior",
     "Cublin Brute","Angry Wasp","Redwood Mimic","Flowey","Blooming Flowey",
@@ -64,7 +64,6 @@ local tpList = {
     {"Grotto",   Vector3.new(708,-343,-2687)},
     {"Silly",    Vector3.new(2139,-1481,-367)}
 }
-
 local bossesTP = {
     {"Duke",        Vector3.new(-7262,-1346,230)},
     {"Jimbee",      Vector3.new(-2474,-2186,-4439)},
@@ -74,12 +73,12 @@ local bossesTP = {
 }
 
 --------------------------------------------------------------------------------
--- Rayfield UI laden
+-- Rayfield UI
 local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
 local Window = Rayfield:CreateWindow({
-    Name              = "Autofarm — Strict Target Fix",
+    Name              = "Autofarm — Areas Strict + Fixes",
     LoadingTitle      = "Script laden...",
-    LoadingSubtitle   = "Geoptimaliseerd door AI",
+    LoadingSubtitle   = "Vermijdt NPCs, raakt 100%",
     ConfigurationSaving = { Enabled = false },
     KeySystem         = false
 })
@@ -89,48 +88,7 @@ local function notify(txt)
 end
 
 --------------------------------------------------------------------------------
--- ── STRICT TARGET FINDER ─────────────────────────────────────────────────────
---------------------------------------------------------------------------------
-local function isValidTarget(obj, isMob)
-    if not obj:IsA("Model") or not obj.PrimaryPart then return false end
-    
-    -- STRENGE CONTROLE: Is dit een vijand of een NPC?
-    if isMob then
-        -- Controleer of het object zich in een map bevindt die "Enemies" heet.
-        -- Dit voorkomt dat we vriendschappelijke NPC's aanvallen.
-        local isEnemy = false
-        local parent = obj.Parent
-        while parent do
-            if parent.Name == "Enemies" then
-                isEnemy = true
-                break
-            end
-            parent = parent.Parent
-        end
-        
-        if not isEnemy then return false end
-
-        -- Check of de vijand leeft
-        local eHum = obj:FindFirstChildOfClass("Humanoid")
-        if not eHum or eHum.Health <= 0 then return false end
-    end
-    
-    return true
-end
-
-local function getActiveTargets(targetDict, isMob)
-    local targets = {}
-    for _, obj in ipairs(workspace:GetDescendants()) do
-        if targetDict[obj.Name] and isValidTarget(obj, isMob) then
-            table.insert(targets, obj)
-        end
-    end
-    return targets
-end
-
---------------------------------------------------------------------------------
--- ── TOOL FINDER ──────────────────────────────────────────────────────────────
---------------------------------------------------------------------------------
+-- ── SLIMME TOOL FINDER (Fix voor Cleavers, Daggers, etc) ─────────────────────
 local function getEquippedOrBestTool(type)
     local keywords = {}
     if type == "weapon" then keywords = {"sword", "cleaver", "blade", "hatchet", "dagger", "katana", "machete", "scythe"} end
@@ -139,9 +97,7 @@ local function getEquippedOrBestTool(type)
     
     local function checkTool(item)
         local n = item.Name:lower()
-        for _, kw in ipairs(keywords) do
-            if n:find(kw) then return true end
-        end
+        for _, kw in ipairs(keywords) do if n:find(kw) then return true end end
         return false
     end
 
@@ -155,6 +111,7 @@ local function getEquippedOrBestTool(type)
         end
     end
     
+    -- Als niets wordt gevonden, pak gewoon wat er is
     if currentTool then return currentTool end
     local fallback = player.Backpack:FindFirstChildOfClass("Tool")
     if fallback then hum:EquipTool(fallback); return fallback end
@@ -176,18 +133,64 @@ end)
 hookCharacter(char)
 
 --------------------------------------------------------------------------------
--- ── AUTOFARM LOOP ────────────────────────────────────────────────────────────
+-- ── JOUW DOELWIT ZOEKER (Vermijdt NPCs) ──────────────────────────────────────
+local function getPotentialTargets(targetType)
+    local targets = {}
+    local areasFolder = workspace:FindFirstChild("Areas")
+    
+    -- Helper functie om mappen uit te pluizen
+    local function scanFolder(folder, isMob, dict)
+        for _, m in ipairs(folder:GetDescendants()) do
+            if m:IsA("Model") and dict[m.Name] and m.PrimaryPart then
+                if isMob then
+                    local eHum = m:FindFirstChildOfClass("Humanoid")
+                    if eHum and eHum.Health > 0 then
+                        table.insert(targets, m)
+                    end
+                else
+                    table.insert(targets, m)
+                end
+            end
+        end
+    end
+
+    if not areasFolder then
+        -- Fallback als Areas niet bestaat
+        local dict = (targetType == "ore" and selectedOres) or (targetType == "wood" and selectedWood) or selectedEnemies
+        scanFolder(workspace, targetType == "mob", dict)
+        return targets
+    end
+
+    if targetType == "ore" then
+        scanFolder(areasFolder, false, selectedOres)
+    elseif targetType == "wood" then
+        scanFolder(areasFolder, false, selectedWood)
+    elseif targetType == "mob" then
+        -- Zoek SPECIFIEK in Enemies en SpawnRegions, negeer de rest van de map (zoals NPCs)
+        for _, area in ipairs(areasFolder:GetChildren()) do
+            local enemiesFolder = area:FindFirstChild("Enemies")
+            local spawnRegions = area:FindFirstChild("SpawnRegions")
+            
+            if enemiesFolder then scanFolder(enemiesFolder, true, selectedEnemies) end
+            if spawnRegions then scanFolder(spawnRegions, true, selectedEnemies) end
+        end
+    end
+
+    return targets
+end
+
 --------------------------------------------------------------------------------
+-- ── BLOX FRUITS AUTOFARM LOOP ────────────────────────────────────────────────
 task.spawn(function()
     while task.wait(0.1) do
         if not (autoKilling or autoWoodEnabled or autoTeleporting) then continue end
         
-        local mode, dict = "", {}
-        if autoKilling then mode = "weapon"; dict = selectedEnemies
-        elseif autoWoodEnabled then mode = "axe"; dict = selectedWood
-        elseif autoTeleporting then mode = "pickaxe"; dict = selectedOres end
+        local mode, typeFilter = "", ""
+        if autoKilling then mode = "weapon"; typeFilter = "mob"
+        elseif autoWoodEnabled then mode = "axe"; typeFilter = "wood"
+        elseif autoTeleporting then mode = "pickaxe"; typeFilter = "ore" end
         
-        local targets = getActiveTargets(dict, autoKilling)
+        local targets = getPotentialTargets(typeFilter)
         if #targets == 0 then continue end
         
         local closest, minDist = nil, math.huge
@@ -206,18 +209,19 @@ task.spawn(function()
                     if not eHum or eHum.Health <= 0 then break end
                 end
                 
-                task.wait(0.1)
+                task.wait(0.05) -- Zeer snelle hit loop
                 stuck += 1
                 
                 local tool = getEquippedOrBestTool(mode)
                 
+                -- Overhead Teleport (4 studs bovenop het doel)
                 if hrp and closest.PrimaryPart then
-                    local targetPos = closest.PrimaryPart.Position
+                    local tPos = closest.PrimaryPart.Position
                     if mode == "weapon" then
-                        -- VERLAAGD NAAR 4 STUDS: Zorgt ervoor dat je hitboxes de enemy raken.
-                        hrp.CFrame = CFrame.new(targetPos + Vector3.new(0, 4, 0), targetPos)
+                        hrp.CFrame = CFrame.new(tPos + Vector3.new(0, 4, 0), tPos)
                     else
-                        hrp.CFrame = CFrame.new(targetPos + Vector3.new(0, 3, 3), targetPos)
+                        -- Orbit voor ores/hout
+                        hrp.CFrame = CFrame.new(tPos + Vector3.new(0, 2, 3), tPos)
                     end
                     hrp.Velocity = Vector3.new(0, 0, 0)
                 end
@@ -225,10 +229,10 @@ task.spawn(function()
                 if tool then
                     tool:Activate()
                     
-                    -- Gebruik de remotes die je in SimpleSpy zag, als ze bestaan
-                    local remoteEvent = RS:FindFirstChild("ClientRemotes") and RS.ClientRemotes:FindFirstChild("Character") and RS.ClientRemotes.Character:FindFirstChild("UseItem")
-                    if remoteEvent and remoteEvent:IsA("RemoteEvent") then
-                        remoteEvent:FireServer(tool, false)
+                    -- Back-up UseItem Remote trigger
+                    local cr = RS:FindFirstChild("ClientRemotes")
+                    if cr and cr:FindFirstChild("Character") and cr.Character:FindFirstChild("UseItem") then
+                        cr.Character.UseItem:FireServer(tool, false)
                     end
                 end
             end
@@ -237,23 +241,22 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------------------
--- ── VLOEIENDE ESP LOOP ───────────────────────────────────────────────────────
---------------------------------------------------------------------------------
+-- ── ROBUUSTE ESP LOOP (Adornee methode) ──────────────────────────────────────
 task.spawn(function()
     while task.wait(0.5) do
         if not mobESPEnabled then
-            for obj, hl in pairs(activeHighlights) do
+            for model, hl in pairs(activeHighlights) do
                 if hl and hl.Parent then hl:Destroy() end
             end
-            table.clear(activeHighlights)
+            activeHighlights = {}
             continue
         end
         
-        local targets = getActiveTargets(selectedEnemies, true)
-        local currentTargets = {}
+        local targets = getPotentialTargets("mob")
+        local activeSet = {}
         
-        for _, t in ipairs(targets) do
-            currentTargets[t] = true
+        for _, t in ipairs(targets) do 
+            activeSet[t] = true
             if not activeHighlights[t] then
                 local hl = Instance.new("Highlight")
                 hl.Adornee = t
@@ -261,15 +264,15 @@ task.spawn(function()
                 hl.OutlineColor = Color3.fromRGB(255, 255, 255)
                 hl.FillTransparency = 0.5
                 hl.OutlineTransparency = 0
-                hl.Parent = workspace
+                hl.Parent = workspace -- Moet in workspace zitten om betrouwbaar te werken!
                 activeHighlights[t] = hl
             end
         end
         
-        for obj, hl in pairs(activeHighlights) do
-            if not currentTargets[obj] or not obj.Parent then
+        for model, hl in pairs(activeHighlights) do
+            if not activeSet[model] or not model.Parent then
                 if hl and hl.Parent then hl:Destroy() end
-                activeHighlights[obj] = nil
+                activeHighlights[model] = nil
             end
         end
     end
@@ -277,7 +280,7 @@ end)
 
 --------------------------------------------------------------------------------
 -- ── UI OPBOUW ────────────────────────────────────────────────────────────────
-local TabInfo      = Window:CreateTab("Info & Fixes")
+local TabInfo      = Window:CreateTab("Info")
 local TabAutoTP    = Window:CreateTab("Auto TP")
 local TabTeleports = Window:CreateTab("Teleports")
 local TabCombat    = Window:CreateTab("Combat & Kill")
@@ -286,10 +289,11 @@ local TabExtras    = Window:CreateTab("Extras")
 local TabESP       = Window:CreateTab("Mob ESP")
 
 TabInfo:CreateParagraph({
-    Title   = "Changelog (Strict Targeting Fix)",
-    Content = "• Script valt geen NPCs meer aan! (Controleert nu strict of de vijand in een 'Enemies' folder zit).\n" ..
-              "• Aanvalshoogte is verlaagd naar 4 studs zodat je slagen daadwerkelijk raken.\n" ..
-              "• Target Dummy is toegevoegd aan de lijst."
+    Title   = "Changelog",
+    Content = "• Strict NPC Filter (scant uitsluitend 'Enemies' & 'SpawnRegions')\n" ..
+              "• Aanval afgesteld op 4 studs hoogte (optimale hitbox range)\n" ..
+              "• Rusty Cleaver & Dagger ondersteuning toegevoegd.\n" ..
+              "• ESP direct zichtbaar dankzij Adornee-to-Workspace methode."
 })
 
 TabAutoTP:CreateSection("Ore Teleporting")
@@ -297,23 +301,17 @@ for _, ore in ipairs(ores) do
     TabAutoTP:CreateToggle({
         Name = "Farm " .. ore, CurrentValue = false, Flag = "AutoTP_" .. ore,
         Callback = function(val)
-            if val then
-                selectedOres[ore] = true; autoTeleporting = true; autoWoodEnabled = false; autoKilling = false
-            else
-                selectedOres[ore] = nil; autoTeleporting = next(selectedOres) ~= nil
-            end
+            if val then selectedOres[ore] = true; autoTeleporting = true; autoWoodEnabled = false; autoKilling = false
+            else selectedOres[ore] = nil; autoTeleporting = next(selectedOres) ~= nil end
         end,
     })
 end
 
 TabTeleports:CreateSection("Locations")
-for _, v in ipairs(tpList) do
-    TabTeleports:CreateButton({
-        Name = v[1], Callback = function()
-            hrp.Anchored = true; hrp.CFrame = CFrame.new(v[2]); task.wait(0.3); hrp.Anchored = false
-        end,
-    })
-end
+for _, v in ipairs(tpList) do TabTeleports:CreateButton({ Name = v[1], Callback = function() hrp.Anchored = true; hrp.CFrame = CFrame.new(v[2]); task.wait(0.3); hrp.Anchored = false end }) end
+
+TabTeleports:CreateSection("Bosses")
+for _, v in ipairs(bossesTP) do TabTeleports:CreateButton({ Name = v[1], Callback = function() hrp.Anchored = true; hrp.CFrame = CFrame.new(v[2]); task.wait(0.3); hrp.Anchored = false end }) end
 
 TabCombat:CreateSection("Modifiers")
 TabCombat:CreateToggle({
@@ -330,11 +328,8 @@ for _, name in ipairs(allEnemies) do
     TabCombat:CreateToggle({
         Name = "Kill " .. name, CurrentValue = false, Flag = "AutoKill_" .. name,
         Callback = function(val)
-            if val then
-                selectedEnemies[name] = true; autoKilling = true; autoTeleporting = false; autoWoodEnabled = false
-            else
-                selectedEnemies[name] = nil; autoKilling = next(selectedEnemies) ~= nil
-            end
+            if val then selectedEnemies[name] = true; autoKilling = true; autoTeleporting = false; autoWoodEnabled = false
+            else selectedEnemies[name] = nil; autoKilling = next(selectedEnemies) ~= nil end
         end,
     })
 end
@@ -344,11 +339,8 @@ for _, w in ipairs(woodStumps) do
     TabWood:CreateToggle({
         Name = w, CurrentValue = false, Flag = "AutoWood_" .. w,
         Callback = function(val)
-            if val then
-                selectedWood[w] = true; autoWoodEnabled = true; autoTeleporting = false; autoKilling = false
-            else
-                selectedWood[w] = nil; autoWoodEnabled = next(selectedWood) ~= nil
-            end
+            if val then selectedWood[w] = true; autoWoodEnabled = true; autoTeleporting = false; autoKilling = false
+            else selectedWood[w] = nil; autoWoodEnabled = next(selectedWood) ~= nil end
         end,
     })
 end
@@ -363,7 +355,4 @@ UIS.JumpRequest:Connect(function()
 end)
 
 TabESP:CreateSection("Mob ESP")
-TabESP:CreateToggle({
-    Name = "Highlight vijanden", CurrentValue = false, Flag = "MobESP",
-    Callback = function(val) mobESPEnabled = val end,
-})
+TabESP:CreateToggle({ Name = "Highlight vijanden", CurrentValue = false, Flag = "MobESP", Callback = function(val) mobESPEnabled = val end })

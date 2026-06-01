@@ -372,7 +372,7 @@ end)
 --------------------------------------------------------------------------------
 -- ── UI OPBOUW ────────────────────────────────────────────────
 
-local TabInfo      = Window:CreateTab("Info")
+local TabInfo      = Window:CreateTab("BIGfo")
 local TabAutoTP    = Window:CreateTab("Auto TP")
 local TabTeleports = Window:CreateTab("Teleports")
 local TabCombat    = Window:CreateTab("Combat & Kill")

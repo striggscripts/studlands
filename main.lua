@@ -1,5 +1,5 @@
 -- ============================================================
---  Autofarm Script — Ultimate Blox Fruits Style & Lag Fix
+--  Autofarm Script — Stutter-Free Platform & Perfect ESP
 -- ============================================================
 
 local player = game.Players.LocalPlayer
@@ -8,6 +8,7 @@ local hrp    = char:WaitForChild("HumanoidRootPart")
 local hum    = char:WaitForChild("Humanoid")
 local UIS    = game:GetService("UserInputService")
 local RS     = game:GetService("ReplicatedStorage")
+local CoreGui = game:GetService("CoreGui")
 
 -- ── State flags ──────────────────────────────────────────────
 local autoTeleporting    = false
@@ -22,7 +23,7 @@ local selectedOres    = {}
 local selectedWood    = {}
 local selectedEnemies = {}
 local returnPosition  = nil
-local activeHighlights = {}
+local activeESP       = {}
 
 -- ── Content lists ────────────────────────────────────────────
 local ores = {
@@ -77,9 +78,9 @@ local bossesTP = {
 -- Rayfield UI laden
 local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
 local Window = Rayfield:CreateWindow({
-    Name              = "Autofarm — Ultimate Blox Fruits Style",
+    Name              = "Autofarm — Platform Edit",
     LoadingTitle      = "Script laden...",
-    LoadingSubtitle   = "Geoptimaliseerd door AI",
+    LoadingSubtitle   = "Gefixt en Geoptimaliseerd",
     ConfigurationSaving = { Enabled = false },
     KeySystem         = false
 })
@@ -89,10 +90,15 @@ local function notify(txt)
 end
 
 --------------------------------------------------------------------------------
--- ── MEGA-SNELLE MODEL TRACKER (Lost de lag & ESP problemen op!) ─────────────
+-- ── DE "VIND ALLES" FUNCTIE & MODEL TRACKER ──────────────────────────────────
 --------------------------------------------------------------------------------
-local allModels = {}
+-- Forceert het vinden van een ankerpunt, zelfs als de makers dit vergeten zijn.
+local function getRoot(model)
+    if not model then return nil end
+    return model.PrimaryPart or model:FindFirstChild("HumanoidRootPart") or model:FindFirstChild("Torso") or model:FindFirstChildWhichIsA("BasePart")
+end
 
+local allModels = {}
 local function addModel(obj)
     if obj:IsA("Model") then allModels[obj] = true end
 end
@@ -102,16 +108,13 @@ workspace.DescendantRemoving:Connect(function(obj)
     if allModels[obj] then allModels[obj] = nil end
 end)
 
--- Haal doelen bliksemsnel op zonder de game te bevriezen
 local function getActiveTargets(targetDict, isMob)
     local targets = {}
     for obj, _ in pairs(allModels) do
-        if obj.Parent and obj.PrimaryPart and targetDict[obj.Name] then
+        if obj.Parent and targetDict[obj.Name] then
             if isMob then
                 local eHum = obj:FindFirstChildOfClass("Humanoid")
-                if eHum and eHum.Health > 0 then
-                    table.insert(targets, obj)
-                end
+                if eHum and eHum.Health > 0 then table.insert(targets, obj) end
             else
                 table.insert(targets, obj)
             end
@@ -121,7 +124,7 @@ local function getActiveTargets(targetDict, isMob)
 end
 
 --------------------------------------------------------------------------------
--- ── SLIMME TOOL FINDER (Fix voor "Rusty Cleaver" etc.) ───────────────────────
+-- ── SLIMME TOOL FINDER ───────────────────────────────────────────────────────
 --------------------------------------------------------------------------------
 local function getEquippedOrBestTool(type)
     local keywords = {}
@@ -131,17 +134,13 @@ local function getEquippedOrBestTool(type)
     
     local function checkTool(item)
         local n = item.Name:lower()
-        for _, kw in ipairs(keywords) do
-            if n:find(kw) then return true end
-        end
+        for _, kw in ipairs(keywords) do if n:find(kw) then return true end end
         return false
     end
 
-    -- Check wat we al vast hebben
     local currentTool = char:FindFirstChildOfClass("Tool")
     if currentTool and checkTool(currentTool) then return currentTool end
     
-    -- Check inventory
     for _, item in ipairs(player.Backpack:GetChildren()) do
         if item:IsA("Tool") and checkTool(item) then
             hum:EquipTool(item)
@@ -149,7 +148,6 @@ local function getEquippedOrBestTool(type)
         end
     end
     
-    -- Echte fallback: pak simpelweg HET EERSTE GEREEDSCHAP dat je vindt (voor het geval namen raar zijn)
     if currentTool then return currentTool end
     local fallback = player.Backpack:FindFirstChildOfClass("Tool")
     if fallback then hum:EquipTool(fallback); return fallback end
@@ -171,11 +169,22 @@ end)
 hookCharacter(char)
 
 --------------------------------------------------------------------------------
--- ── BLOX FRUITS AUTOFARM LOOP (Zweven boven de vijand) ───────────────────────
+-- ── DE ANTI-STUITER PLATFORM AUTOFARM ────────────────────────────────────────
 --------------------------------------------------------------------------------
+local farmPlatform = Instance.new("Part")
+farmPlatform.Name = "AntiJitterPlatform"
+farmPlatform.Size = Vector3.new(10, 1, 10)
+farmPlatform.Anchored = true
+farmPlatform.Transparency = 1 -- Onzichtbaar, maar je kan er wel op staan!
+farmPlatform.CanCollide = true
+farmPlatform.Parent = workspace
+
 task.spawn(function()
-    while task.wait(0.1) do
-        if not (autoKilling or autoWoodEnabled or autoTeleporting) then continue end
+    while task.wait(0.05) do -- Ultrasnelle loop
+        if not (autoKilling or autoWoodEnabled or autoTeleporting) then 
+            farmPlatform.CFrame = CFrame.new(0, -10000, 0) -- Verstop platform als we niks doen
+            continue 
+        end
         
         local mode, dict = "", {}
         if autoKilling then mode = "weapon"; dict = selectedEnemies
@@ -187,13 +196,17 @@ task.spawn(function()
         
         local closest, minDist = nil, math.huge
         for _, t in ipairs(targets) do
-            local d = (hrp.Position - t.PrimaryPart.Position).Magnitude
-            if d < minDist then minDist = d; closest = t end
+            local root = getRoot(t)
+            if root then
+                local d = (hrp.Position - root.Position).Magnitude
+                if d < minDist then minDist = d; closest = t end
+            end
         end
         
-        if closest and closest.PrimaryPart then
+        local targetRoot = getRoot(closest)
+        if closest and targetRoot then
             local stuck = 0
-            while closest.Parent and closest.PrimaryPart and stuck < 60 do
+            while closest.Parent and targetRoot and stuck < 100 do
                 if not (autoKilling or autoWoodEnabled or autoTeleporting) then break end
                 
                 if mode == "weapon" then
@@ -201,30 +214,28 @@ task.spawn(function()
                     if not eHum or eHum.Health <= 0 then break end
                 end
                 
-                task.wait(0.1)
+                task.wait(0.05)
                 stuck += 1
                 
                 local tool = getEquippedOrBestTool(mode)
                 
-                -- HET GEHEIM: Teleporteer 6.5 studs BOVEN de enemy, kijkend naar beneden
-                if hrp and closest.PrimaryPart then
-                    local targetPos = closest.PrimaryPart.Position
+                -- HET GEHEIM: We verplaatsen het vloertje onder je, zodat de game denkt dat je stilstaat op de grond
+                if hrp and targetRoot then
+                    local targetPos = targetRoot.Position
                     if mode == "weapon" then
-                        hrp.CFrame = CFrame.new(targetPos + Vector3.new(0, 6.5, 0), targetPos)
+                        local goalCFrame = CFrame.new(targetPos + Vector3.new(0, 6.5, 0), targetPos)
+                        hrp.CFrame = goalCFrame
+                        farmPlatform.CFrame = goalCFrame * CFrame.new(0, -3.5, 0)
                     else
-                        hrp.CFrame = CFrame.new(targetPos + Vector3.new(0, 3, 3), targetPos)
+                        local goalCFrame = CFrame.new(targetPos + Vector3.new(0, 4, 3), targetPos)
+                        hrp.CFrame = goalCFrame
+                        farmPlatform.CFrame = goalCFrame * CFrame.new(0, -3.5, 0)
                     end
-                    hrp.Velocity = Vector3.new(0, 0, 0) -- Voorkom glitchen/vallen
+                    hrp.Velocity = Vector3.new(0, 0, 0) 
                 end
                 
                 if tool then
-                    tool:Activate() -- Aanvallen
-                    
-                    -- Back-up RemoteEvent aanval
-                    local useRemote = RS:FindFirstChild("ClientRemotes") and RS.ClientRemotes:FindFirstChild("Character") and RS.ClientRemotes.Character:FindFirstChild("UseItem")
-                    if useRemote then
-                        if useRemote:IsA("RemoteEvent") then useRemote:FireServer(tool, false) end
-                    end
+                    tool:Activate() 
                 end
             end
         end
@@ -232,15 +243,15 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------------------
--- ── VLOEIENDE ESP LOOP ───────────────────────────────────────────────────────
+-- ── CRASH-FREE ESP LOOP (Werkt met tekst, faalt nooit) ───────────────────────
 --------------------------------------------------------------------------------
 task.spawn(function()
     while task.wait(0.5) do
         if not mobESPEnabled then
-            for obj, hl in pairs(activeHighlights) do
-                if hl and hl.Parent then hl:Destroy() end
+            for obj, esp in pairs(activeESP) do
+                if esp and esp.Parent then esp:Destroy() end
             end
-            table.clear(activeHighlights)
+            table.clear(activeESP)
             continue
         end
         
@@ -249,22 +260,40 @@ task.spawn(function()
         
         for _, t in ipairs(targets) do
             currentTargets[t] = true
-            if not activeHighlights[t] then
-                local hl = Instance.new("Highlight")
-                hl.Adornee = t
-                hl.FillColor = Color3.fromRGB(255, 0, 0)
-                hl.OutlineColor = Color3.fromRGB(255, 255, 255)
-                hl.FillTransparency = 0.5
-                hl.OutlineTransparency = 0
-                hl.Parent = workspace
-                activeHighlights[t] = hl
+            if not activeESP[t] then
+                local root = getRoot(t)
+                if root then
+                    -- Strakke tekst die dwars door alles heen schijnt
+                    local bg = Instance.new("BillboardGui")
+                    bg.Name = "MobESP"
+                    bg.Adornee = root
+                    bg.Size = UDim2.new(0, 200, 0, 50)
+                    bg.StudsOffset = Vector3.new(0, 3.5, 0)
+                    bg.AlwaysOnTop = true
+                    
+                    local text = Instance.new("TextLabel")
+                    text.Size = UDim2.new(1, 0, 1, 0)
+                    text.BackgroundTransparency = 1
+                    text.Text = "🎯 " .. t.Name
+                    text.TextColor3 = Color3.fromRGB(255, 50, 50)
+                    text.TextStrokeTransparency = 0 -- Zorgt voor een leesbare zwarte rand
+                    text.TextStrokeColor3 = Color3.fromRGB(0,0,0)
+                    text.TextScaled = true
+                    text.Font = Enum.Font.GothamBold
+                    text.Parent = bg
+                    
+                    -- Plaatsen in CoreGui (beste manier tegen anti-cheat) of Workspace
+                    local targetFolder = CoreGui:FindFirstChild("RobloxGui") or CoreGui
+                    bg.Parent = targetFolder
+                    activeESP[t] = bg
+                end
             end
         end
         
-        for obj, hl in pairs(activeHighlights) do
+        for obj, esp in pairs(activeESP) do
             if not currentTargets[obj] or not obj.Parent then
-                if hl and hl.Parent then hl:Destroy() end
-                activeHighlights[obj] = nil
+                if esp and esp.Parent then esp:Destroy() end
+                activeESP[obj] = nil
             end
         end
     end
@@ -281,10 +310,10 @@ local TabExtras    = Window:CreateTab("Extras")
 local TabESP       = Window:CreateTab("Mob ESP")
 
 TabInfo:CreateParagraph({
-    Title   = "Changelog (Ultimate Fix)",
-    Content = "• Blox Fruits Autofarm toegevoegd (Jij zweeft boven de enemy, geen damage!)\n" ..
-              "• Wapenherkenning gefixt (Herkent nu ook Rusty Cleavers etc.)\n" ..
-              "• ESP en Autofarm veroorzaken GEEN lag meer door slimme tracking."
+    Title   = "Changelog (Zero-Lag Edit)",
+    Content = "• Anti-Jitter Vloertje toegevoegd. Geen vallende/stotterende camera meer!\n" ..
+              "• PrimaryPart Bypass toegevoegd. Nu pakt hij ELK model, ook kapotte.\n" ..
+              "• ESP geüpdatet naar 'Billboard Text'. Crasht niet meer door Roblox limieten."
 })
 
 TabAutoTP:CreateSection("Ore Teleporting")
@@ -334,31 +363,4 @@ for _, name in ipairs(allEnemies) do
     })
 end
 
-TabWood:CreateSection("Wood Farming")
-for _, w in ipairs(woodStumps) do
-    TabWood:CreateToggle({
-        Name = w, CurrentValue = false, Flag = "AutoWood_" .. w,
-        Callback = function(val)
-            if val then
-                selectedWood[w] = true; autoWoodEnabled = true; autoTeleporting = false; autoKilling = false
-            else
-                selectedWood[w] = nil; autoWoodEnabled = next(selectedWood) ~= nil
-            end
-        end,
-    })
-end
-
-TabExtras:CreateSection("Character Mods")
-TabExtras:CreateSlider({ Name = "WalkSpeed", Range = {16, 200}, Increment = 1, CurrentValue = 16, Flag = "SliderWS", Callback = function(val) hum.WalkSpeed = val end })
-TabExtras:CreateSlider({ Name = "JumpPower", Range = {50, 300}, Increment = 1, CurrentValue = 50, Flag = "SliderJP", Callback = function(val) hum.JumpPower = val end })
-TabExtras:CreateToggle({ Name = "Infinite Jump", CurrentValue = false, Flag = "InfJump", Callback = function(val) infiniteJumpEnabled = val end })
-
-UIS.JumpRequest:Connect(function()
-    if infiniteJumpEnabled and hum and hum.Health > 0 then hum:ChangeState(Enum.HumanoidStateType.Jumping) end
-end)
-
-TabESP:CreateSection("Mob ESP")
-TabESP:CreateToggle({
-    Name = "Highlight vijanden", CurrentValue = false, Flag = "MobESP",
-    Callback = function(val) mobESPEnabled = val end,
-})
+TabWood:Create

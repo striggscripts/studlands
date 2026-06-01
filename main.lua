@@ -4,10 +4,9 @@ local char = player.Character or player.CharacterAdded:Wait()
 local hrp = char:WaitForChild("HumanoidRootPart")
 local humanoid = char:WaitForChild("Humanoid")
 local UIS = game:GetService("UserInputService")
-local runService = game:GetService("RunService")
 local RS = game:GetService("ReplicatedStorage")
 
--- Haal de juiste remotes op die je hebt gevonden
+-- Haal de juiste remotes op
 local clientRemotes = RS:WaitForChild("ClientRemotes", 10)
 local equipRemote = clientRemotes and clientRemotes:WaitForChild("Inventory"):WaitForChild("EquipItem")
 local useRemote = clientRemotes and clientRemotes:WaitForChild("Character"):WaitForChild("UseItem")
@@ -48,70 +47,69 @@ local bosses = {
 }
 
 local tpList = {
-    {"Home", Vector3.new(-591,-351,-195)},
-    {"Forest", Vector3.new(-819,-175,-1623)},
-    {"Plains", Vector3.new(-591,-349,-679)},
-    {"Flowey", Vector3.new(-30,-350,-1132)},
-    {"Redwood", Vector3.new(-1222,-353,-622)},
-    {"Ballzone", Vector3.new(188,-361,83)},
-    {"Wretched", Vector3.new(-2731,-269,-522)},
-    {"Cherry", Vector3.new(727,-166,-2528)},
-    {"Mushey", Vector3.new(-1930,-292,-361)},
-    {"Tundra", Vector3.new(-1809,15,-2327)},
-    {"Desert", Vector3.new(258,-269,1200)},
-    {"Grotto", Vector3.new(708,-343,-2687)},
+    {"Home", Vector3.new(-591,-351,-195)}, {"Forest", Vector3.new(-819,-175,-1623)},
+    {"Plains", Vector3.new(-591,-349,-679)}, {"Flowey", Vector3.new(-30,-350,-1132)},
+    {"Redwood", Vector3.new(-1222,-353,-622)}, {"Ballzone", Vector3.new(188,-361,83)},
+    {"Wretched", Vector3.new(-2731,-269,-522)}, {"Cherry", Vector3.new(727,-166,-2528)},
+    {"Mushey", Vector3.new(-1930,-292,-361)}, {"Tundra", Vector3.new(-1809,15,-2327)},
+    {"Desert", Vector3.new(258,-269,1200)}, {"Grotto", Vector3.new(708,-343,-2687)},
     {"Silly", Vector3.new(2139,-1481,-367)}
 }
-
 local bossesTP = {
-    {"Duke", Vector3.new(-7262,-1346,230)},
-    {"Jimbee", Vector3.new(-2474,-2186,-4439)},
-    {"Pharaoh", Vector3.new(-3972,-1528,2630)},
-    {"Musheynator", Vector3.new(-1787,-322,11)},
+    {"Duke", Vector3.new(-7262,-1346,230)}, {"Jimbee", Vector3.new(-2474,-2186,-4439)},
+    {"Pharaoh", Vector3.new(-3972,-1528,2630)}, {"Musheynator", Vector3.new(-1787,-322,11)},
     {"Ice Giant", Vector3.new(-2030,-65,-2006)}
 }
 
 --------------------------------------------------------------------------------
--- Load Rayfield
+-- Load Rayfield UI
 local Rayfield = loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
-
 local Window = Rayfield:CreateWindow({
     Name = "Ore Teleporter & Autofarm",
     LoadingTitle = "Loading Script...",
-    LoadingSubtitle = "Geoptimaliseerd met Custom Remotes",
+    LoadingSubtitle = "V3: Slimme Folders & Remotes",
     ConfigurationSaving = { Enabled = false },
     KeySystem = false
 })
 
 --------------------------------------------------------------------------------
+-- Dynamic Folder Caching (Jouw idee tegen Lag!)
+--------------------------------------------------------------------------------
+local enemyFolders = {}
+
+task.spawn(function()
+    while true do
+        local eFolders = {}
+        for _, obj in ipairs(workspace:GetDescendants()) do
+            if obj:IsA("Folder") or obj:IsA("Model") then
+                local nm = obj.Name:lower()
+                -- Zoek dynamisch naar de mapjes waar enemies en mobs in zitten
+                if nm == "enemies" or nm == "mobs" or nm == "monsters" then
+                    table.insert(eFolders, obj)
+                end
+            end
+        end
+        enemyFolders = eFolders
+        task.wait(5) -- Checkt elke 5 seconden (nul lag!)
+    end
+end)
+
+--------------------------------------------------------------------------------
 -- Utility Functions
 local function showNotification(txt)
-    Rayfield:Notify({
-        Title = "Systeem Melding",
-        Content = txt,
-        Duration = 3,
-        Image = 4483362458
-    })
+    Rayfield:Notify({Title = "Systeem Melding", Content = txt, Duration = 3, Image = 4483362458})
 end
 
--- Verbeterde Auto-Equip via de officiële game remote
 local function equipTool(keyword)
     local currentTool = char:FindFirstChildOfClass("Tool")
-    if currentTool and currentTool.Name:lower():find(keyword) then
-        return currentTool
-    end
+    if currentTool and currentTool.Name:lower():find(keyword) then return currentTool end
     
     for _, item in ipairs(player.Backpack:GetChildren()) do
         if item:IsA("Tool") and item.Name:lower():find(keyword) then
             if equipRemote then
-                if equipRemote:IsA("RemoteFunction") then
-                    equipRemote:InvokeServer(item.Name)
-                elseif equipRemote:IsA("RemoteEvent") then
-                    equipRemote:FireServer(item.Name)
-                end
-            else
-                humanoid:EquipTool(item)
-            end
+                if equipRemote:IsA("RemoteFunction") then equipRemote:InvokeServer(item.Name)
+                elseif equipRemote:IsA("RemoteEvent") then equipRemote:FireServer(item.Name) end
+            else humanoid:EquipTool(item) end
             return item
         end
     end
@@ -128,12 +126,8 @@ local function removeCooldown(tool)
 end
 
 local function hookCharacter(c)
-    c.ChildAdded:Connect(function(ch)
-        if ch:IsA("Tool") then removeCooldown(ch) end
-    end)
-    for _, t in pairs(c:GetChildren()) do
-        if t:IsA("Tool") then removeCooldown(t) end
-    end
+    c.ChildAdded:Connect(function(ch) if ch:IsA("Tool") then removeCooldown(ch) end end)
+    for _, t in pairs(c:GetChildren()) do if t:IsA("Tool") then removeCooldown(t) end end
 end
 
 player.CharacterAdded:Connect(function(c)
@@ -151,54 +145,49 @@ task.spawn(function()
     while task.wait(0.1) do
         if autoTeleporting or autoWoodEnabled or autoKilling then
             
-            local targetDict = {}
             local toolKeyword = ""
             local offset = CFrame.new(0, 3, 0)
             
-            if autoTeleporting then
-                targetDict = selectedOres
-                toolKeyword = "pickaxe"
-            elseif autoWoodEnabled then
-                targetDict = selectedWood
-                toolKeyword = "axe"
-                offset = CFrame.new(0, 4, 0)
-            elseif autoKilling then
-                targetDict = selectedEnemies
-                toolKeyword = "sword" 
-                offset = CFrame.new(0, 4, 0)
+            if autoTeleporting then toolKeyword = "pickaxe"
+            elseif autoWoodEnabled then toolKeyword = "axe" offset = CFrame.new(0, 4, 0)
+            elseif autoKilling then toolKeyword = "sword" offset = CFrame.new(0, 4, 0)
             end
             
-            -- Automatisch tool equippen via Remote
             local myTool = equipTool(toolKeyword)
-            if not myTool and toolKeyword == "sword" then
-                myTool = equipTool("cleaver")
-            end
-            if not myTool and toolKeyword == "axe" then
-                myTool = equipTool("hatchet") -- Toegevoegd omdat je een Rusty Hatchet hebt
-            end
+            if not myTool and toolKeyword == "sword" then myTool = equipTool("cleaver") end
+            if not myTool and toolKeyword == "axe" then myTool = equipTool("hatchet") end
             
-            if not myTool then
-                showNotification("Geen " .. toolKeyword .. " in inventory gevonden!")
-                task.wait(2)
-                continue
-            end
+            if not myTool then task.wait(1) continue end
             
-            -- Zoek het DICHTSTBIJZIJNDE doelwit
             local closestTarget = nil
             local shortestDist = math.huge
             
-            for _, m in ipairs(workspace:GetDescendants()) do
-                if m:IsA("Model") and targetDict[m.Name] and m.PrimaryPart then
-                    
-                    if autoKilling then
-                        local eHum = m:FindFirstChild("Humanoid")
-                        if not eHum or eHum.Health <= 0 then continue end
+            if autoKilling then
+                -- ZOEK ENKEL IN ENEMIES FOLDERS (Jouw idee!)
+                for _, folder in ipairs(enemyFolders) do
+                    for _, m in ipairs(folder:GetChildren()) do
+                        if m:IsA("Model") and selectedEnemies[m.Name] and m.PrimaryPart then
+                            local eHum = m:FindFirstChild("Humanoid")
+                            if eHum and eHum.Health > 0 then
+                                local dist = (hrp.Position - m.PrimaryPart.Position).Magnitude
+                                if dist < shortestDist then
+                                    shortestDist = dist
+                                    closestTarget = m
+                                end
+                            end
+                        end
                     end
-                    
-                    local dist = (hrp.Position - m.PrimaryPart.Position).Magnitude
-                    if dist < shortestDist then
-                        shortestDist = dist
-                        closestTarget = m
+                end
+            else
+                -- VOOR ORES EN HOUT (Geen aparte map voor)
+                local targetDict = autoTeleporting and selectedOres or selectedWood
+                for _, m in ipairs(workspace:GetDescendants()) do
+                    if m:IsA("Model") and targetDict[m.Name] and m.PrimaryPart then
+                        local dist = (hrp.Position - m.PrimaryPart.Position).Magnitude
+                        if dist < shortestDist then
+                            shortestDist = dist
+                            closestTarget = m
+                        end
                     end
                 end
             end
@@ -216,12 +205,12 @@ task.spawn(function()
                     end
                     
                     if myTool then
-                        -- Gebruik de nieuw gevonden UseItem remote
+                        -- GEFIXTE AANVAL REMOTE UIT JOUW LOGS
                         if useRemote then
-                            if useRemote:IsA("RemoteEvent") then
-                                useRemote:FireServer(myTool, false)
-                            elseif useRemote:IsA("RemoteFunction") then
-                                useRemote:InvokeServer(myTool, false)
+                            if useRemote:IsA("RemoteFunction") then
+                                pcall(function() useRemote:InvokeServer(myTool, false, {0}) end)
+                            elseif useRemote:IsA("RemoteEvent") then
+                                pcall(function() useRemote:FireServer(myTool, false, {0}) end)
                             end
                         else
                             myTool:Activate()
@@ -243,26 +232,28 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------------------
--- LAG VRIJE ESP LOOP
+-- LAG VRIJE ESP LOOP (Kijkt ook enkel in de enemy mappen!)
 --------------------------------------------------------------------------------
 task.spawn(function()
     while task.wait(1) do
         if mobESPEnabled then
-            for _, m in ipairs(workspace:GetDescendants()) do
-                if m:IsA("Model") and table.find(mobs, m.Name) then
-                    local hum = m:FindFirstChild("Humanoid")
-                    if hum and hum.Health > 0 then
-                        if not m:FindFirstChild("ESPHighlight") then
-                            local hl = Instance.new("Highlight")
-                            hl.Name = "ESPHighlight"
-                            hl.FillColor = Color3.fromRGB(255, 0, 0)
-                            hl.OutlineColor = Color3.fromRGB(255, 255, 255)
-                            hl.FillTransparency = 0.5
-                            hl.Parent = m
+            for _, folder in ipairs(enemyFolders) do
+                for _, m in ipairs(folder:GetChildren()) do
+                    if m:IsA("Model") and table.find(mobs, m.Name) then
+                        local hum = m:FindFirstChild("Humanoid")
+                        if hum and hum.Health > 0 then
+                            if not m:FindFirstChild("ESPHighlight") then
+                                local hl = Instance.new("Highlight")
+                                hl.Name = "ESPHighlight"
+                                hl.FillColor = Color3.fromRGB(255, 0, 0)
+                                hl.OutlineColor = Color3.fromRGB(255, 255, 255)
+                                hl.FillTransparency = 0.5
+                                hl.Parent = m
+                            end
+                        elseif hum and hum.Health <= 0 then
+                            local hl = m:FindFirstChild("ESPHighlight")
+                            if hl then hl:Destroy() end
                         end
-                    elseif hum and hum.Health <= 0 then
-                        local hl = m:FindFirstChild("ESPHighlight")
-                        if hl then hl:Destroy() end
                     end
                 end
             end
@@ -271,7 +262,7 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------------------
--- UI Tabs Setup (Ongewijzigd)
+-- UI Tabs Setup
 local TabInfo = Window:CreateTab("Info")
 local TabAutoTP = Window:CreateTab("Auto TP")
 local TabTeleports = Window:CreateTab("Teleports")
@@ -280,85 +271,38 @@ local TabWood = Window:CreateTab("Auto Wood")
 local TabExtras = Window:CreateTab("Extras")
 local TabESP = Window:CreateTab("Mob ESP")
 
-TabInfo:CreateParagraph({Title = "Status", Content = "Script geoptimaliseerd: Gebruikt nu verborgen ClientRemotes."})
+TabInfo:CreateParagraph({Title = "Status", Content = "ESP en Combat zoeken nu slim alleen in Enemies mapjes. Remotes zijn geüpdatet met de juiste Spy parameters."})
 
 TabAutoTP:CreateSection("Ore Teleporting")
 for _, ore in ipairs(ores) do
     TabAutoTP:CreateToggle({
-        Name = "Farm " .. ore,
-        CurrentValue = false,
-        Flag = "AutoTP_" .. ore,
+        Name = "Farm " .. ore, CurrentValue = false, Flag = "AutoTP_" .. ore,
         Callback = function(Value)
-            if Value then
-                selectedOres[ore] = true
-                autoTeleporting = true
-                autoWoodEnabled = false
-                autoKilling = false
-            else
-                selectedOres[ore] = nil
-                autoTeleporting = next(selectedOres) ~= nil
-            end
+            if Value then selectedOres[ore] = true; autoTeleporting = true; autoWoodEnabled = false; autoKilling = false
+            else selectedOres[ore] = nil; autoTeleporting = next(selectedOres) ~= nil end
         end,
     })
 end
 
 TabTeleports:CreateSection("Locations")
-for _, v in ipairs(tpList) do
-    TabTeleports:CreateButton({
-        Name = v[1],
-        Callback = function()
-            hrp.Anchored = true
-            hrp.CFrame = CFrame.new(v[2])
-            task.wait(0.3)
-            hrp.Anchored = false
-        end,
-    })
-end
-
+for _, v in ipairs(tpList) do TabTeleports:CreateButton({Name = v[1], Callback = function() hrp.Anchored = true; hrp.CFrame = CFrame.new(v[2]); task.wait(0.3); hrp.Anchored = false end}) end
 TabTeleports:CreateSection("Bosses")
-for _, v in ipairs(bossesTP) do
-    TabTeleports:CreateButton({
-        Name = v[1],
-        Callback = function()
-            hrp.Anchored = true
-            hrp.CFrame = CFrame.new(v[2])
-            task.wait(0.3)
-            hrp.Anchored = false
-        end,
-    })
-end
+for _, v in ipairs(bossesTP) do TabTeleports:CreateButton({Name = v[1], Callback = function() hrp.Anchored = true; hrp.CFrame = CFrame.new(v[2]); task.wait(0.3); hrp.Anchored = false end}) end
 
 TabCombat:CreateSection("Modifiers")
-TabCombat:CreateToggle({
-    Name = "No Cooldown",
-    CurrentValue = false,
-    Flag = "NoCooldown",
-    Callback = function(Value)
-        noCooldownEnabled = Value
-        hookCharacter(char)
-    end,
-})
-
+TabCombat:CreateToggle({Name = "No Cooldown", CurrentValue = false, Flag = "NoCooldown", Callback = function(Value) noCooldownEnabled = Value; hookCharacter(char) end})
 TabCombat:CreateSection("Auto Kill Targets")
+
 local allEnemies = {}
 for _, v in ipairs(mobs) do table.insert(allEnemies, v) end
 for _, v in ipairs(bosses) do table.insert(allEnemies, v) end
 
 for _, name in ipairs(allEnemies) do
     TabCombat:CreateToggle({
-        Name = "Kill " .. name,
-        CurrentValue = false,
-        Flag = "AutoKill_" .. name,
+        Name = "Kill " .. name, CurrentValue = false, Flag = "AutoKill_" .. name,
         Callback = function(Value)
-            if Value then
-                selectedEnemies[name] = true
-                autoTeleporting = false
-                autoWoodEnabled = false
-                autoKilling = true
-            else
-                selectedEnemies[name] = nil
-                autoKilling = next(selectedEnemies) ~= nil
-            end
+            if Value then selectedEnemies[name] = true; autoTeleporting = false; autoWoodEnabled = false; autoKilling = true
+            else selectedEnemies[name] = nil; autoKilling = next(selectedEnemies) ~= nil end
         end,
     })
 end
@@ -366,97 +310,45 @@ end
 TabWood:CreateSection("Wood Farming")
 for _, w in ipairs(woodStumps) do
     TabWood:CreateToggle({
-        Name = w,
-        CurrentValue = false,
-        Flag = "AutoWood_" .. w,
+        Name = w, CurrentValue = false, Flag = "AutoWood_" .. w,
         Callback = function(Value)
-            if Value then
-                selectedWood[w] = true
-                autoWoodEnabled = true
-                autoTeleporting = false
-                autoKilling = false
-            else
-                selectedWood[w] = nil
-                autoWoodEnabled = next(selectedWood) ~= nil
-            end
+            if Value then selectedWood[w] = true; autoWoodEnabled = true; autoTeleporting = false; autoKilling = false
+            else selectedWood[w] = nil; autoWoodEnabled = next(selectedWood) ~= nil end
         end,
     })
 end
 
 TabExtras:CreateSection("Character Mods")
-TabExtras:CreateSlider({
-    Name = "WalkSpeed",
-    Range = {16, 100},
-    Increment = 1,
-    CurrentValue = 16,
-    Flag = "SliderWS",
-    Callback = function(Value)
-        humanoid.WalkSpeed = Value
-    end,
-})
-
-TabExtras:CreateSlider({
-    Name = "JumpPower",
-    Range = {50, 200},
-    Increment = 1,
-    CurrentValue = 50,
-    Flag = "SliderJP",
-    Callback = function(Value)
-        humanoid.JumpPower = Value
-    end,
-})
-
-TabExtras:CreateToggle({
-    Name = "Semi-God Mode",
-    CurrentValue = false,
-    Flag = "SemiGod",
-    Callback = function(Value)
-        semiGodEnabled = Value
-    end,
-})
+TabExtras:CreateSlider({Name = "WalkSpeed", Range = {16, 100}, Increment = 1, CurrentValue = 16, Flag = "SliderWS", Callback = function(Value) humanoid.WalkSpeed = Value end})
+TabExtras:CreateSlider({Name = "JumpPower", Range = {50, 200}, Increment = 1, CurrentValue = 50, Flag = "SliderJP", Callback = function(Value) humanoid.JumpPower = Value end})
+TabExtras:CreateToggle({Name = "Semi-God Mode", CurrentValue = false, Flag = "SemiGod", Callback = function(Value) semiGodEnabled = Value end})
 
 humanoid.HealthChanged:Connect(function(hp)
     if semiGodEnabled and autoKilling and hp > 0 and hp < 30 then
         returnPosition = hrp.CFrame
         showNotification("Health low! Terugtrekken...")
         hrp.CFrame = CFrame.new(-564, -315, -1093)
-
         repeat task.wait(1) until humanoid.Health >= humanoid.MaxHealth
-
         showNotification("Genezingsproces voltooid! Terugkeren...")
-        if returnPosition then
-            hrp.CFrame = returnPosition
-        end
+        if returnPosition then hrp.CFrame = returnPosition end
     end
 end)
 
-TabExtras:CreateToggle({
-    Name = "Infinite Jump",
-    CurrentValue = false,
-    Flag = "InfJump",
-    Callback = function(Value)
-        infiniteJumpEnabled = Value
-    end,
-})
-
-UIS.JumpRequest:Connect(function()
-    if infiniteJumpEnabled and humanoid and humanoid.Health > 0 then
-        humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
-    end
-end)
+TabExtras:CreateToggle({Name = "Infinite Jump", CurrentValue = false, Flag = "InfJump", Callback = function(Value) infiniteJumpEnabled = Value end})
+UIS.JumpRequest:Connect(function() if infiniteJumpEnabled and humanoid and humanoid.Health > 0 then humanoid:ChangeState(Enum.HumanoidStateType.Jumping) end end)
 
 TabESP:CreateSection("Visuals")
 TabESP:CreateToggle({
-    Name = "Highlight Mobs",
-    CurrentValue = false,
-    Flag = "MobESP",
+    Name = "Highlight Mobs", CurrentValue = false, Flag = "MobESP",
     Callback = function(Value)
         mobESPEnabled = Value
         if not Value then
-            for _, m in ipairs(workspace:GetDescendants()) do
-                if m:IsA("Model") then
-                    local hl = m:FindFirstChild("ESPHighlight")
-                    if hl then hl:Destroy() end
+            for _, folder in ipairs(enemyFolders) do
+                for _, m in ipairs(folder:GetChildren()) do
+                    if m:IsA("Model") then
+                        local hl = m:FindFirstChild("ESPHighlight")
+                        if hl then hl:Destroy() end
+                    end
                 end
             end
         end

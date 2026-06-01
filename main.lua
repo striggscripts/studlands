@@ -5,6 +5,12 @@ local hrp = char:WaitForChild("HumanoidRootPart")
 local humanoid = char:WaitForChild("Humanoid")
 local UIS = game:GetService("UserInputService")
 local runService = game:GetService("RunService")
+local RS = game:GetService("ReplicatedStorage")
+
+-- Haal de juiste remotes op die je hebt gevonden
+local clientRemotes = RS:WaitForChild("ClientRemotes", 10)
+local equipRemote = clientRemotes and clientRemotes:WaitForChild("Inventory"):WaitForChild("EquipItem")
+local useRemote = clientRemotes and clientRemotes:WaitForChild("Character"):WaitForChild("UseItem")
 
 -- State flags
 local autoTeleporting = false
@@ -72,7 +78,7 @@ local Rayfield = loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
 local Window = Rayfield:CreateWindow({
     Name = "Ore Teleporter & Autofarm",
     LoadingTitle = "Loading Script...",
-    LoadingSubtitle = "Geoptimaliseerd",
+    LoadingSubtitle = "Geoptimaliseerd met Custom Remotes",
     ConfigurationSaving = { Enabled = false },
     KeySystem = false
 })
@@ -88,7 +94,7 @@ local function showNotification(txt)
     })
 end
 
--- Nieuwe functie: Automatisch de juiste tool pakken uit je inventory
+-- Verbeterde Auto-Equip via de officiële game remote
 local function equipTool(keyword)
     local currentTool = char:FindFirstChildOfClass("Tool")
     if currentTool and currentTool.Name:lower():find(keyword) then
@@ -97,7 +103,15 @@ local function equipTool(keyword)
     
     for _, item in ipairs(player.Backpack:GetChildren()) do
         if item:IsA("Tool") and item.Name:lower():find(keyword) then
-            humanoid:EquipTool(item)
+            if equipRemote then
+                if equipRemote:IsA("RemoteFunction") then
+                    equipRemote:InvokeServer(item.Name)
+                elseif equipRemote:IsA("RemoteEvent") then
+                    equipRemote:FireServer(item.Name)
+                end
+            else
+                humanoid:EquipTool(item)
+            end
             return item
         end
     end
@@ -154,10 +168,13 @@ task.spawn(function()
                 offset = CFrame.new(0, 4, 0)
             end
             
-            -- Automatisch tool equippen (zoekt ook naar cleaver als sword faalt)
+            -- Automatisch tool equippen via Remote
             local myTool = equipTool(toolKeyword)
             if not myTool and toolKeyword == "sword" then
                 myTool = equipTool("cleaver")
+            end
+            if not myTool and toolKeyword == "axe" then
+                myTool = equipTool("hatchet") -- Toegevoegd omdat je een Rusty Hatchet hebt
             end
             
             if not myTool then
@@ -173,7 +190,6 @@ task.spawn(function()
             for _, m in ipairs(workspace:GetDescendants()) do
                 if m:IsA("Model") and targetDict[m.Name] and m.PrimaryPart then
                     
-                    -- Check of het wel leeft (bij enemies)
                     if autoKilling then
                         local eHum = m:FindFirstChild("Humanoid")
                         if not eHum or eHum.Health <= 0 then continue end
@@ -189,7 +205,7 @@ task.spawn(function()
             
             -- Val aan / Hak
             if closestTarget and closestTarget.PrimaryPart then
-                local stuckTimer = 0 -- Voorkomt oneindig vastzitten
+                local stuckTimer = 0
                 
                 repeat
                     task.wait(0.15)
@@ -200,15 +216,18 @@ task.spawn(function()
                     end
                     
                     if myTool then
-                        local remote = workspace:FindFirstChild("Remotes") and workspace.Remotes:FindFirstChild("UseItem")
-                        if remote then
-                            remote:FireServer(myTool, false)
+                        -- Gebruik de nieuw gevonden UseItem remote
+                        if useRemote then
+                            if useRemote:IsA("RemoteEvent") then
+                                useRemote:FireServer(myTool, false)
+                            elseif useRemote:IsA("RemoteFunction") then
+                                useRemote:InvokeServer(myTool, false)
+                            end
                         else
-                            myTool:Activate() -- Fallback als remote niet werkt
+                            myTool:Activate()
                         end
                     end
                     
-                    -- Check of doelwit dood/vernietigd is
                     local isAlive = true
                     if autoKilling then
                         local h = closestTarget:FindFirstChild("Humanoid")
@@ -224,26 +243,24 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------------------
--- LAG VRIJE ESP LOOP (Alleen levende enemies)
+-- LAG VRIJE ESP LOOP
 --------------------------------------------------------------------------------
 task.spawn(function()
-    while task.wait(1) do -- 1x per seconde is genoeg, scheelt veel lag
+    while task.wait(1) do
         if mobESPEnabled then
             for _, m in ipairs(workspace:GetDescendants()) do
                 if m:IsA("Model") and table.find(mobs, m.Name) then
                     local hum = m:FindFirstChild("Humanoid")
                     if hum and hum.Health > 0 then
-                        -- Check of hij al een highlight heeft
                         if not m:FindFirstChild("ESPHighlight") then
                             local hl = Instance.new("Highlight")
                             hl.Name = "ESPHighlight"
-                            hl.FillColor = Color3.fromRGB(255, 0, 0) -- Rood
+                            hl.FillColor = Color3.fromRGB(255, 0, 0)
                             hl.OutlineColor = Color3.fromRGB(255, 255, 255)
                             hl.FillTransparency = 0.5
                             hl.Parent = m
                         end
                     elseif hum and hum.Health <= 0 then
-                        -- Haal highlight weg als hij dood is
                         local hl = m:FindFirstChild("ESPHighlight")
                         if hl then hl:Destroy() end
                     end
@@ -254,7 +271,7 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------------------
--- UI Tabs Setup
+-- UI Tabs Setup (Ongewijzigd)
 local TabInfo = Window:CreateTab("Info")
 local TabAutoTP = Window:CreateTab("Auto TP")
 local TabTeleports = Window:CreateTab("Teleports")
@@ -263,10 +280,8 @@ local TabWood = Window:CreateTab("Auto Wood")
 local TabExtras = Window:CreateTab("Extras")
 local TabESP = Window:CreateTab("Mob ESP")
 
--- Tab 1: Info
-TabInfo:CreateParagraph({Title = "Status", Content = "Script geoptimaliseerd: Anti-Lag, Auto-Equip en Smart Targeting toegevoegd."})
+TabInfo:CreateParagraph({Title = "Status", Content = "Script geoptimaliseerd: Gebruikt nu verborgen ClientRemotes."})
 
--- Tab 2: Auto TP (Ores)
 TabAutoTP:CreateSection("Ore Teleporting")
 for _, ore in ipairs(ores) do
     TabAutoTP:CreateToggle({
@@ -287,7 +302,6 @@ for _, ore in ipairs(ores) do
     })
 end
 
--- Tab 3: Teleports
 TabTeleports:CreateSection("Locations")
 for _, v in ipairs(tpList) do
     TabTeleports:CreateButton({
@@ -314,7 +328,6 @@ for _, v in ipairs(bossesTP) do
     })
 end
 
--- Tab 4: Combat (No Cooldown & Auto Kill)
 TabCombat:CreateSection("Modifiers")
 TabCombat:CreateToggle({
     Name = "No Cooldown",
@@ -350,7 +363,6 @@ for _, name in ipairs(allEnemies) do
     })
 end
 
--- Tab 5: Auto Wood
 TabWood:CreateSection("Wood Farming")
 for _, w in ipairs(woodStumps) do
     TabWood:CreateToggle({
@@ -371,7 +383,6 @@ for _, w in ipairs(woodStumps) do
     })
 end
 
--- Tab 6: Extras
 TabExtras:CreateSection("Character Mods")
 TabExtras:CreateSlider({
     Name = "WalkSpeed",
@@ -434,7 +445,6 @@ UIS.JumpRequest:Connect(function()
     end
 end)
 
--- Tab 7: Mob ESP
 TabESP:CreateSection("Visuals")
 TabESP:CreateToggle({
     Name = "Highlight Mobs",
@@ -443,7 +453,6 @@ TabESP:CreateToggle({
     Callback = function(Value)
         mobESPEnabled = Value
         if not Value then
-            -- Clean-up als we het uitschakelen
             for _, m in ipairs(workspace:GetDescendants()) do
                 if m:IsA("Model") then
                     local hl = m:FindFirstChild("ESPHighlight")

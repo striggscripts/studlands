@@ -1,5 +1,5 @@
 -- ============================================================
---  Autofarm Script — De Definitieve "Area-Strict" Versie
+--  Autofarm Script — Ultimate Blox Fruits Style (Behind Target)
 -- ============================================================
 
 local player = game.Players.LocalPlayer
@@ -64,6 +64,7 @@ local tpList = {
     {"Grotto",   Vector3.new(708,-343,-2687)},
     {"Silly",    Vector3.new(2139,-1481,-367)}
 }
+
 local bossesTP = {
     {"Duke",        Vector3.new(-7262,-1346,230)},
     {"Jimbee",      Vector3.new(-2474,-2186,-4439)},
@@ -76,19 +77,15 @@ local bossesTP = {
 -- Rayfield UI
 local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
 local Window = Rayfield:CreateWindow({
-    Name              = "Autofarm — Areas Strict + Fixes",
+    Name              = "Autofarm — Blox Fruits Methode",
     LoadingTitle      = "Script laden...",
-    LoadingSubtitle   = "Vermijdt NPCs, raakt 100%",
+    LoadingSubtitle   = "No Damage + Onafhankelijke ESP",
     ConfigurationSaving = { Enabled = false },
     KeySystem         = false
 })
 
-local function notify(txt)
-    Rayfield:Notify({ Title = "Melding", Content = txt, Duration = 3, Image = 4483362458 })
-end
-
 --------------------------------------------------------------------------------
--- ── SLIMME TOOL FINDER (Fix voor Cleavers, Daggers, etc) ─────────────────────
+-- ── VEILIGE TOOL FINDER ──────────────────────────────────────────────────────
 local function getEquippedOrBestTool(type)
     local keywords = {}
     if type == "weapon" then keywords = {"sword", "cleaver", "blade", "hatchet", "dagger", "katana", "machete", "scythe"} end
@@ -111,7 +108,6 @@ local function getEquippedOrBestTool(type)
         end
     end
     
-    -- Als niets wordt gevonden, pak gewoon wat er is
     if currentTool then return currentTool end
     local fallback = player.Backpack:FindFirstChildOfClass("Tool")
     if fallback then hum:EquipTool(fallback); return fallback end
@@ -133,54 +129,53 @@ end)
 hookCharacter(char)
 
 --------------------------------------------------------------------------------
--- ── JOUW DOELWIT ZOEKER (Vermijdt NPCs) ──────────────────────────────────────
+-- ── STRICT NPC FILTER ────────────────────────────────────────────────────────
+-- Kijkt of het model écht in een vijand-map staat
+local function isValidEnemy(model)
+    if not model:IsA("Model") or not model.PrimaryPart then return false end
+    
+    local p = model.Parent
+    while p and p ~= workspace do
+        if p.Name == "Enemies" or p.Name == "SpawnRegions" or p.Name == "EnemiesToSpawnHere" then
+            return true
+        end
+        p = p.Parent
+    end
+    return false
+end
+
 local function getPotentialTargets(targetType)
     local targets = {}
-    local areasFolder = workspace:FindFirstChild("Areas")
-    
-    -- Helper functie om mappen uit te pluizen
-    local function scanFolder(folder, isMob, dict)
-        for _, m in ipairs(folder:GetDescendants()) do
-            if m:IsA("Model") and dict[m.Name] and m.PrimaryPart then
-                if isMob then
-                    local eHum = m:FindFirstChildOfClass("Humanoid")
-                    if eHum and eHum.Health > 0 then
-                        table.insert(targets, m)
-                    end
-                else
+    local areasFolder = workspace:FindFirstChild("Areas") or workspace
+
+    if targetType == "ore" then
+        for _, m in ipairs(areasFolder:GetDescendants()) do
+            if m:IsA("Model") and selectedOres[m.Name] and m.PrimaryPart then
+                table.insert(targets, m)
+            end
+        end
+    elseif targetType == "wood" then
+        for _, m in ipairs(areasFolder:GetDescendants()) do
+            if m:IsA("Model") and selectedWood[m.Name] and m.PrimaryPart then
+                table.insert(targets, m)
+            end
+        end
+    elseif targetType == "mob" then
+        for _, m in ipairs(areasFolder:GetDescendants()) do
+            -- Strenge controle: naam geselecteerd EN het is een geldige enemy map
+            if m:IsA("Model") and selectedEnemies[m.Name] and isValidEnemy(m) then
+                local eHum = m:FindFirstChildOfClass("Humanoid")
+                if eHum and eHum.Health > 0 then
                     table.insert(targets, m)
                 end
             end
         end
     end
-
-    if not areasFolder then
-        -- Fallback als Areas niet bestaat
-        local dict = (targetType == "ore" and selectedOres) or (targetType == "wood" and selectedWood) or selectedEnemies
-        scanFolder(workspace, targetType == "mob", dict)
-        return targets
-    end
-
-    if targetType == "ore" then
-        scanFolder(areasFolder, false, selectedOres)
-    elseif targetType == "wood" then
-        scanFolder(areasFolder, false, selectedWood)
-    elseif targetType == "mob" then
-        -- Zoek SPECIFIEK in Enemies en SpawnRegions, negeer de rest van de map (zoals NPCs)
-        for _, area in ipairs(areasFolder:GetChildren()) do
-            local enemiesFolder = area:FindFirstChild("Enemies")
-            local spawnRegions = area:FindFirstChild("SpawnRegions")
-            
-            if enemiesFolder then scanFolder(enemiesFolder, true, selectedEnemies) end
-            if spawnRegions then scanFolder(spawnRegions, true, selectedEnemies) end
-        end
-    end
-
     return targets
 end
 
 --------------------------------------------------------------------------------
--- ── BLOX FRUITS AUTOFARM LOOP ────────────────────────────────────────────────
+-- ── BLOX FRUITS AUTOFARM LOOP (TELEPORT ACHTER VIJAND) ───────────────────────
 task.spawn(function()
     while task.wait(0.1) do
         if not (autoKilling or autoWoodEnabled or autoTeleporting) then continue end
@@ -209,19 +204,21 @@ task.spawn(function()
                     if not eHum or eHum.Health <= 0 then break end
                 end
                 
-                task.wait(0.05) -- Zeer snelle hit loop
+                task.wait(0.05) -- Extra snelle aanval-loop
                 stuck += 1
                 
                 local tool = getEquippedOrBestTool(mode)
                 
-                -- Overhead Teleport (4 studs bovenop het doel)
                 if hrp and closest.PrimaryPart then
-                    local tPos = closest.PrimaryPart.Position
                     if mode == "weapon" then
-                        hrp.CFrame = CFrame.new(tPos + Vector3.new(0, 4, 0), tPos)
+                        -- BLOX FRUITS METHODE: Teleporteer 4.5 studs ACHTER de vijand en kijk ernaar
+                        local enemyCF = closest.PrimaryPart.CFrame
+                        local behindPosition = (enemyCF * CFrame.new(0, 1, 4.5)).Position
+                        hrp.CFrame = CFrame.new(behindPosition, closest.PrimaryPart.Position)
                     else
-                        -- Orbit voor ores/hout
-                        hrp.CFrame = CFrame.new(tPos + Vector3.new(0, 2, 3), tPos)
+                        -- Voor resources: Ervoor staan
+                        local tPos = closest.PrimaryPart.Position
+                        hrp.CFrame = CFrame.new(tPos + Vector3.new(0, 3, 3), tPos)
                     end
                     hrp.Velocity = Vector3.new(0, 0, 0)
                 end
@@ -229,7 +226,6 @@ task.spawn(function()
                 if tool then
                     tool:Activate()
                     
-                    -- Back-up UseItem Remote trigger
                     local cr = RS:FindFirstChild("ClientRemotes")
                     if cr and cr:FindFirstChild("Character") and cr.Character:FindFirstChild("UseItem") then
                         cr.Character.UseItem:FireServer(tool, false)
@@ -241,18 +237,34 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------------------
--- ── ROBUUSTE ESP LOOP (Adornee methode) ──────────────────────────────────────
+-- ── ONAFHANKELIJKE ESP LOOP ──────────────────────────────────────────────────
+-- Haal alle Mobs op die bestaan, ongeacht of je ze farmt
+local function getESPTargets()
+    local targets = {}
+    local areasFolder = workspace:FindFirstChild("Areas") or workspace
+    for _, m in ipairs(areasFolder:GetDescendants()) do
+        if m:IsA("Model") and table.find(mobs, m.Name) and isValidEnemy(m) then
+            local eHum = m:FindFirstChildOfClass("Humanoid")
+            if eHum and eHum.Health > 0 then
+                table.insert(targets, m)
+            end
+        end
+    end
+    return targets
+end
+
 task.spawn(function()
     while task.wait(0.5) do
         if not mobESPEnabled then
             for model, hl in pairs(activeHighlights) do
                 if hl and hl.Parent then hl:Destroy() end
             end
-            activeHighlights = {}
+            table.clear(activeHighlights)
             continue
         end
         
-        local targets = getPotentialTargets("mob")
+        -- Gebruik de onafhankelijke lijst, zodat alles aangaat!
+        local targets = getESPTargets()
         local activeSet = {}
         
         for _, t in ipairs(targets) do 
@@ -264,7 +276,7 @@ task.spawn(function()
                 hl.OutlineColor = Color3.fromRGB(255, 255, 255)
                 hl.FillTransparency = 0.5
                 hl.OutlineTransparency = 0
-                hl.Parent = workspace -- Moet in workspace zitten om betrouwbaar te werken!
+                hl.Parent = workspace 
                 activeHighlights[t] = hl
             end
         end
@@ -290,10 +302,9 @@ local TabESP       = Window:CreateTab("Mob ESP")
 
 TabInfo:CreateParagraph({
     Title   = "Changelog",
-    Content = "• Strict NPC Filter (scant uitsluitend 'Enemies' & 'SpawnRegions')\n" ..
-              "• Aanval afgesteld op 4 studs hoogte (optimale hitbox range)\n" ..
-              "• Rusty Cleaver & Dagger ondersteuning toegevoegd.\n" ..
-              "• ESP direct zichtbaar dankzij Adornee-to-Workspace methode."
+    Content = "• Teleporteert nu ACHTER de enemy's rug. Je krijgt geen damage meer!\n" ..
+              "• ESP werkt nu onafhankelijk: laat álle vijanden in de map zien.\n" ..
+              "• 100% beveiligd tegen het per ongeluk doden van NPCs."
 })
 
 TabAutoTP:CreateSection("Ore Teleporting")

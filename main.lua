@@ -1,12 +1,16 @@
 -- ============================================================
---  Autofarm Script v2 — Full Fix Edition
+--  Autofarm Script v3 — Direct Remote Edition
 -- ============================================================
--- FIXES:
---  1. No damage during auto kill → health reset loop tied to autoKill flag
---  2. Auto Ore fixed → searches full workspace + handles nil PrimaryPart
---  3. Auto Wood fixed → same fix + registers alternate stump names
---  4. ESP no longer lags on toggle → staggered cleanup + separate update loop
---  5. ESP now shows: HP bar, HP/MaxHP, distance, boss tag, colored stripe
+-- WHAT CHANGED FROM v2:
+--  • Combat now fires ClientRemotes.Enemies.DamageDone directly
+--    → no swing delay, no teleport twitch, enemies die instantly
+--  • Resources fire ClientRemotes.Resources.ResourceDamageDone directly
+--    → instant mining/chopping, no animation wait
+--  • Resources are read from workspace.ResourceSpawns (their real home)
+--  • Real no-damage: enemies are killed before they can hit you.
+--    (The old hum.Health reset was client-only = "just visual".)
+--  • "Teleport to target" is now an OPTIONAL toggle (default OFF)
+--    so there is no twitching unless the remote needs proximity.
 -- ============================================================
 
 local Players = game:GetService("Players")
@@ -18,19 +22,28 @@ local char   = player.Character or player.CharacterAdded:Wait()
 local hrp    = char:WaitForChild("HumanoidRootPart")
 local hum    = char:WaitForChild("Humanoid")
 
+-- ── Remotes (from your rSpy capture) ───────────────────────
+local CR        = RS:WaitForChild("ClientRemotes")
+local rDamage   = CR:WaitForChild("Enemies"):WaitForChild("DamageDone")
+local rResDmg   = CR:WaitForChild("Resources"):WaitForChild("ResourceDamageDone")
+local rUseItem  = CR:WaitForChild("Character"):WaitForChild("UseItem")
+local rEquip    = CR:WaitForChild("Inventory"):WaitForChild("EquipItem")
+
 -- ── State flags ────────────────────────────────────────────
 local autoOre      = false
 local autoWood     = false
 local autoKill     = false
 local noCooldown   = false
-local noDamage     = false
+local healthLoop   = false   -- optional client-side HP reset (may be visual only)
 local infiniteJump = false
 local espEnabled   = false
+local tpToTarget   = false   -- only TP if the game validates proximity
+local instantKill  = true    -- send lethal damage (faster, but more detectable)
 
 local selOres    = {}
 local selWood    = {}
 local selEnemies = {}
-local espCache   = {}   -- [model] = {hl, bb, infoL, hpFill, eHum, rootPart}
+local espCache   = {}
 
 -- ── Content lists ──────────────────────────────────────────
 local oreNames = {
@@ -38,13 +51,10 @@ local oreNames = {
     "Salt Rock","Meteorite","Jade","Blood Stone","Sapphire",
     "Amethyst","Obsidian","Shroomium","Sandstone"
 }
-
--- FIX: include alternate names the game might use (no "Stump" suffix)
 local woodNames = {
     "Oak Stump","Redwood Stump","Spruce Stump",
     "Oak","Redwood","Spruce"
 }
-
 local mobNames = {
     "Cubey","Wedgey","Field Mousey","Flying Goldfish","Wooden Mimic","Dummy","Target Dummy",
     "Cavey","Spidey","Bonezo","Cave Spidey","Sentient Assault Rifle","Mini Cubey",
@@ -63,7 +73,6 @@ local bossNames = {
     "Enormous Ballzo","Glacier Giant","Lord Cublindor","Blazing Jimbee","Orbdenier"
 }
 
--- Quick lookup sets (O(1) instead of table.find loops)
 local bossSet   = {}; for _, b in ipairs(bossNames) do bossSet[b]   = true end
 local allMobSet = {}
 for _, m in ipairs(mobNames)  do allMobSet[m] = true end
@@ -92,15 +101,13 @@ local bossTPList = {
     {"Ice Giant",   Vector3.new(-2030,-65,-2006)}
 }
 
--- ── No-cooldown hook ───────────────────────────────────────
+-- ── Character respawn ──────────────────────────────────────
 local function hookCooldowns(c)
-    -- Hook any future descendants added at runtime
     c.DescendantAdded:Connect(function(d)
         if d:IsA("NumberValue") and (d.Name:find("Cooldown") or d.Name:find("Debounce")) then
             d.Changed:Connect(function() if noCooldown then d.Value = 0 end end)
         end
     end)
-    -- Hook existing descendants
     for _, d in ipairs(c:GetDescendants()) do
         if d:IsA("NumberValue") and (d.Name:find("Cooldown") or d.Name:find("Debounce")) then
             if noCooldown then d.Value = 0 end
@@ -108,8 +115,6 @@ local function hookCooldowns(c)
         end
     end
 end
-
--- Character respawn handler
 player.CharacterAdded:Connect(function(c)
     char = c
     hrp  = c:WaitForChild("HumanoidRootPart")
@@ -118,51 +123,59 @@ player.CharacterAdded:Connect(function(c)
 end)
 hookCooldowns(char)
 
--- ── FIX 1: No Damage ──────────────────────────────────────
--- Runs at ~20 Hz; resets health when auto killing or standalone toggle is on.
--- Works on games that don't fully server-validate health.
+-- ── Optional client HP reset (kept as a minor safety net) ──
 task.spawn(function()
-    while task.wait(0.05) do
-        if (autoKill or noDamage) and hum and hum.Parent then
-            if hum.Health > 0 then
-                hum.Health = hum.MaxHealth
-            end
+    while task.wait(0.1) do
+        if healthLoop and hum and hum.Parent and hum.Health > 0 then
+            hum.Health = hum.MaxHealth
         end
     end
 end)
 
--- ── Tool finder ────────────────────────────────────────────
-local function getTool(toolType)
-    local kw = {}
+-- ── Root part helper (handles nil PrimaryPart) ─────────────
+local function getRootPart(obj)
+    if obj:IsA("Model") then
+        return obj.PrimaryPart or obj:FindFirstChildOfClass("BasePart")
+    elseif obj:IsA("BasePart") then
+        return obj
+    end
+    return nil
+end
+
+-- ── Tool matcher + equipper ────────────────────────────────
+local function toolMatches(item, toolType)
+    local n = item.Name:lower()
+    local kw
     if toolType == "weapon" then
         kw = {"sword","cleaver","blade","dagger","katana","machete","scythe","knife","rapier"}
     elseif toolType == "pickaxe" then
         kw = {"pick","pickaxe","drill","mattock","mine"}
     elseif toolType == "axe" then
         kw = {"axe","hatchet","chop","lumber"}
-    end
-
-    local function matches(item)
-        local n = item.Name:lower()
-        for _, k in ipairs(kw) do if n:find(k) then return true end end
+    else
         return false
     end
+    for _, k in ipairs(kw) do if n:find(k) then return true end end
+    return false
+end
 
+-- Equips the right tool ONLY when needed (avoids spamming EquipItem)
+local function ensureTool(toolType)
     local cur = char:FindFirstChildOfClass("Tool")
-    if cur and matches(cur) then return cur end
+    if cur and toolMatches(cur, toolType) then return cur end
 
+    local pick
     for _, t in ipairs(player.Backpack:GetChildren()) do
-        if t:IsA("Tool") and matches(t) then
-            hum:EquipTool(t)
-            return t
-        end
+        if t:IsA("Tool") and toolMatches(t, toolType) then pick = t break end
     end
+    pick = pick or cur or player.Backpack:FindFirstChildOfClass("Tool")
 
-    -- Fallback: whatever is equipped or first in backpack
-    if cur then return cur end
-    local fb = player.Backpack:FindFirstChildOfClass("Tool")
-    if fb then hum:EquipTool(fb); return fb end
-    return nil
+    if pick then
+        pcall(function() rEquip:InvokeServer(pick.Name) end)  -- tell server
+        pcall(function() hum:EquipTool(pick) end)             -- local equip
+        return char:FindFirstChildOfClass("Tool") or pick
+    end
+    return cur
 end
 
 -- ── Enemy validator ────────────────────────────────────────
@@ -178,61 +191,53 @@ local function isEnemy(model)
     return false
 end
 
--- ── FIX 2: Safe root part (handles nil PrimaryPart) ───────
--- This was the core bug: m.PrimaryPart returned nil → whole model skipped silently
-local function getRootPart(obj)
-    if obj:IsA("Model") then
-        return obj.PrimaryPart or obj:FindFirstChildOfClass("BasePart")
-    elseif obj:IsA("BasePart") then
-        return obj
-    end
-    return nil
-end
-
--- ── FIX 2: Target scanner ─────────────────────────────────
--- Ore/Wood now search ENTIRE workspace, not just Areas.
--- Also supports bare BaseParts (some ores are just parts, not full Models).
-local function getTargets(mode)
+-- ── Target scanners ────────────────────────────────────────
+local function getEnemyTargets()
     local list = {}
-
-    if mode == "mob" then
-        local root = workspace:FindFirstChild("Areas") or workspace
-        for _, obj in ipairs(root:GetDescendants()) do
-            if obj:IsA("Model") and selEnemies[obj.Name] and isEnemy(obj) then
-                local eHum = obj:FindFirstChildOfClass("Humanoid")
-                local part = getRootPart(obj)
-                if eHum and eHum.Health > 0 and part then
-                    table.insert(list, {obj=obj, part=part, hum=eHum})
-                end
-            end
-        end
-
-    elseif mode == "ore" then
-        -- Search ALL of workspace — ores may not live inside Areas
-        for _, obj in ipairs(workspace:GetDescendants()) do
-            if selOres[obj.Name] then
-                local part = getRootPart(obj)
-                if part then
-                    table.insert(list, {obj=obj, part=part})
-                end
-            end
-        end
-
-    elseif mode == "wood" then
-        for _, obj in ipairs(workspace:GetDescendants()) do
-            if selWood[obj.Name] then
-                local part = getRootPart(obj)
-                if part then
-                    table.insert(list, {obj=obj, part=part})
-                end
+    local root = workspace:FindFirstChild("Areas") or workspace
+    for _, obj in ipairs(root:GetDescendants()) do
+        if obj:IsA("Model") and selEnemies[obj.Name] and isEnemy(obj) then
+            local eHum = obj:FindFirstChildOfClass("Humanoid")
+            local part = getRootPart(obj)
+            if eHum and eHum.Health > 0 and part then
+                table.insert(list, {obj=obj, part=part, hum=eHum})
             end
         end
     end
-
     return list
 end
 
--- Find closest target in list
+-- Resources live at workspace.ResourceSpawns[area][node].CurrentResources[...]
+local function getResourceTargets(selSet)
+    local list = {}
+    local spawns = workspace:FindFirstChild("ResourceSpawns")
+    if spawns then
+        for _, area in ipairs(spawns:GetChildren()) do
+            for _, node in ipairs(area:GetChildren()) do
+                local cur = node:FindFirstChild("CurrentResources")
+                if cur then
+                    for _, res in ipairs(cur:GetChildren()) do
+                        if selSet[res.Name] then
+                            local part = getRootPart(res)
+                            if part then table.insert(list, {obj=res, part=part}) end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    -- Fallback: full workspace scan if structure differs / empty
+    if #list == 0 then
+        for _, obj in ipairs(workspace:GetDescendants()) do
+            if selSet[obj.Name] then
+                local part = getRootPart(obj)
+                if part then table.insert(list, {obj=obj, part=part}) end
+            end
+        end
+    end
+    return list
+end
+
 local function getClosest(list)
     local best, bestD = nil, math.huge
     for _, t in ipairs(list) do
@@ -244,98 +249,91 @@ local function getClosest(list)
     return best
 end
 
--- ── Main farm loop ─────────────────────────────────────────
+-- ── Positioning (only when tpToTarget is on; ONE jump per target) ──
+local function tpBehind(part)
+    if not (hrp and part and part.Parent) then return end
+    local behind = (part.CFrame * CFrame.new(0, 1, 5)).Position
+    hrp.CFrame = CFrame.new(behind, part.Position)
+    hrp.Velocity = Vector3.new(0,0,0)
+end
+local function tpNear(part)
+    if not (hrp and part and part.Parent) then return end
+    local pos = part.Position
+    hrp.CFrame = CFrame.new(pos + Vector3.new(3.5, 2, 0), pos)
+    hrp.Velocity = Vector3.new(0,0,0)
+end
+
+-- ── Combat: fire DamageDone directly ───────────────────────
+local function dealEnemyDamage(enemy, weapon, dmg)
+    -- Args mirror your capture: (enemy, weapon, damage, false, 0, 0)
+    pcall(function() rDamage:FireServer(enemy, weapon, dmg, false, 0, 0) end)
+    -- Backup: legit swing in case the server requires UseItem
+    pcall(function() rUseItem:FireServer(weapon, false, nil, nil, 0.6) end)
+end
+
+-- ── Resources: fire ResourceDamageDone directly ────────────
+local function dealResourceDamage(res, tool, dmg)
+    pcall(function() rResDmg:FireServer(res, tool, dmg, false, 0, 0) end)
+    pcall(function() rUseItem:FireServer(tool, false, nil, nil, 0.6) end)
+end
+
+-- ══════════════════════════════════════════════════════════
+-- MAIN FARM LOOP
+-- ══════════════════════════════════════════════════════════
 task.spawn(function()
-    while task.wait(0.1) do
-        if not (autoKill or autoWood or autoOre) then continue end
+    while task.wait(0.03) do
+        if not (autoKill or autoOre or autoWood) then continue end
 
-        local mode     = autoKill and "mob"  or (autoWood and "wood"    or "ore")
-        local toolType = autoKill and "weapon" or (autoWood and "axe" or "pickaxe")
+        if autoKill then
+            -- COMBAT
+            local target = getClosest(getEnemyTargets())
+            if not target then continue end
 
-        local targets = getTargets(mode)
-        local target  = getClosest(targets)
-        if not target then continue end
+            local obj, part = target.obj, target.part
+            local eHum = target.hum
+            local weapon = ensureTool("weapon")
+            if not weapon then continue end
 
-        local obj  = target.obj
-        local part = target.part
-        -- Resources need more attempts (120 × 0.05s = 6s); mobs less
-        local maxTries = (mode == "mob") and 80 or 150
-        local stuck = 0
+            if tpToTarget then tpBehind(part) end   -- single jump, only if enabled
 
-        while obj.Parent and part.Parent and stuck < maxTries do
-            if not (autoKill or autoWood or autoOre) then break end
-
-            -- Kill dead mob early
-            if mode == "mob" then
-                local eHum = target.hum or obj:FindFirstChildOfClass("Humanoid")
-                if not eHum or eHum.Health <= 0 then break end
+            local tries = 0
+            while obj.Parent and eHum and eHum.Health > 0 and tries < 60 do
+                if not autoKill then break end
+                local dmg = instantKill and (eHum.MaxHealth + 100) or math.max(eHum.MaxHealth * 0.25, 25)
+                dealEnemyDamage(obj, weapon, dmg)
+                tries += 1
+                task.wait(0.03)
             end
 
-            -- Teleport to target
-            if hrp and part.Parent then
-                if mode == "mob" then
-                    -- In Roblox CFrame local space +Z is backward (behind the model).
-                    -- We stand 5 studs behind the enemy looking toward it.
-                    local behind = (part.CFrame * CFrame.new(0, 1, 5)).Position
-                    hrp.CFrame = CFrame.new(behind, part.Position)
-                else
-                    -- Stand beside the resource at swing range
-                    local pos = part.Position
-                    hrp.CFrame = CFrame.new(pos + Vector3.new(3.5, 2, 0), pos)
-                end
-                hrp.Velocity = Vector3.new(0, 0, 0)
+        else
+            -- RESOURCES
+            local mode    = autoWood and "wood" or "ore"
+            local selSet  = autoWood and selWood or selOres
+            local toolType = autoWood and "axe" or "pickaxe"
+
+            local target = getClosest(getResourceTargets(selSet))
+            if not target then continue end
+
+            local obj, part = target.obj, target.part
+            local tool = ensureTool(toolType)
+            if not tool then continue end
+
+            if tpToTarget then tpNear(part) end
+
+            local tries = 0
+            while obj.Parent and part.Parent and tries < 100 do
+                if not (autoOre or autoWood) then break end
+                dealResourceDamage(obj, tool, 9999)
+                tries += 1
+                task.wait(0.03)
             end
-
-            -- Equip and activate tool
-            local tool = getTool(toolType)
-            if tool then
-                pcall(function() tool:Activate() end)
-
-                -- Fire game-specific UseItem remote if it exists
-                local cr = RS:FindFirstChild("ClientRemotes")
-                if cr then
-                    local charR = cr:FindFirstChild("Character")
-                    if charR then
-                        local useItem = charR:FindFirstChild("UseItem")
-                        if useItem then
-                            pcall(function() useItem:FireServer(tool, false) end)
-                        end
-                    end
-                end
-
-                -- Try ProximityPrompt interaction (used by many resource games)
-                if mode ~= "mob" then
-                    local pp = obj:FindFirstChild("ProximityPrompt", true)
-                           or part:FindFirstChildOfClass("ProximityPrompt")
-                    if pp then
-                        pcall(function()
-                            pp:InputHoldBegin()
-                            task.wait(0.1)
-                            pp:InputHoldEnd()
-                        end)
-                    end
-                    -- Try ClickDetector (older resource style)
-                    local cd = obj:FindFirstChild("ClickDetector", true)
-                           or part:FindFirstChildOfClass("ClickDetector")
-                    if cd then
-                        pcall(function() fireClickDetector(cd) end)
-                    end
-                end
-            end
-
-            task.wait(0.05)
-            stuck += 1
         end
     end
 end)
 
--- ═══════════════════════════════════════════════════════════
--- FIX 3 + 4: IMPROVED ESP
--- - Scan loop  (0.5s): finds new targets, removes dead ones
--- - Update loop (0.1s): refreshes labels (HP, distance)
--- - Toggle OFF: staggered destruction → no frame spike
--- ═══════════════════════════════════════════════════════════
-
+-- ══════════════════════════════════════════════════════════
+-- ESP (unchanged from v2 — staggered cleanup, HP bar, distance)
+-- ══════════════════════════════════════════════════════════
 local function destroyESP(model)
     local d = espCache[model]
     if not d then return end
@@ -346,117 +344,78 @@ end
 
 local function buildESP(model)
     if espCache[model] then return end
-
     local eHum  = model:FindFirstChildOfClass("Humanoid")
     local rootP = getRootPart(model)
     if not eHum or not rootP then return end
-
     local isBoss = bossSet[model.Name] ~= nil
 
-    -- ── Highlight ──────────────────────────────────────────
     local hl = Instance.new("Highlight")
     hl.Adornee             = model
-    hl.FillColor           = isBoss and Color3.fromRGB(255, 130,  0) or Color3.fromRGB(200, 30, 30)
-    hl.OutlineColor        = isBoss and Color3.fromRGB(255, 210,  0) or Color3.fromRGB(255,255,255)
+    hl.FillColor           = isBoss and Color3.fromRGB(255,130,0) or Color3.fromRGB(200,30,30)
+    hl.OutlineColor        = isBoss and Color3.fromRGB(255,210,0) or Color3.fromRGB(255,255,255)
     hl.FillTransparency    = 0.45
     hl.OutlineTransparency = 0
-    hl.DepthMode           = Enum.HighlightDepthMode.AlwaysOnTop   -- shows through walls
+    hl.DepthMode           = Enum.HighlightDepthMode.AlwaysOnTop
     hl.Parent              = workspace
 
-    -- ── BillboardGui ───────────────────────────────────────
     local bb = Instance.new("BillboardGui")
-    bb.Size        = UDim2.new(0, 160, 0, 72)
-    bb.StudsOffset = Vector3.new(0, 4.5, 0)
+    bb.Size        = UDim2.new(0,160,0,72)
+    bb.StudsOffset = Vector3.new(0,4.5,0)
     bb.AlwaysOnTop = true
     bb.MaxDistance = 250
     bb.Adornee     = rootP
     bb.Parent      = workspace
 
-    -- Background
     local bg = Instance.new("Frame")
-    bg.Size                  = UDim2.new(1,0,1,0)
-    bg.BackgroundColor3      = Color3.fromRGB(10,10,10)
-    bg.BackgroundTransparency = 0.4
-    bg.BorderSizePixel       = 0
-    bg.Parent                = bb
-    local bgC = Instance.new("UICorner"); bgC.CornerRadius = UDim.new(0,5); bgC.Parent = bg
+    bg.Size = UDim2.new(1,0,1,0); bg.BackgroundColor3 = Color3.fromRGB(10,10,10)
+    bg.BackgroundTransparency = 0.4; bg.BorderSizePixel = 0; bg.Parent = bb
+    Instance.new("UICorner", bg).CornerRadius = UDim.new(0,5)
 
-    -- Colored top stripe (red for mob, orange for boss)
     local stripe = Instance.new("Frame")
-    stripe.Size             = UDim2.new(1,0,0,3)
+    stripe.Size = UDim2.new(1,0,0,3); stripe.BorderSizePixel = 0
     stripe.BackgroundColor3 = isBoss and Color3.fromRGB(255,200,0) or Color3.fromRGB(255,50,50)
-    stripe.BorderSizePixel  = 0
-    stripe.Parent           = bg
+    stripe.Parent = bg
 
-    -- Name label
     local nameL = Instance.new("TextLabel")
-    nameL.Size                   = UDim2.new(1,-4,0.38,0)
-    nameL.Position               = UDim2.new(0,2,0,5)
+    nameL.Size = UDim2.new(1,-4,0.38,0); nameL.Position = UDim2.new(0,2,0,5)
     nameL.BackgroundTransparency = 1
-    nameL.Text                   = (isBoss and "[BOSS] " or "") .. model.Name
-    nameL.TextColor3             = isBoss and Color3.fromRGB(255,215,0) or Color3.fromRGB(255,120,120)
-    nameL.TextStrokeTransparency = 0.3
-    nameL.TextStrokeColor3       = Color3.fromRGB(0,0,0)
-    nameL.TextScaled             = true
-    nameL.Font                   = Enum.Font.GothamBold
-    nameL.Parent                 = bg
+    nameL.Text = (isBoss and "[BOSS] " or "") .. model.Name
+    nameL.TextColor3 = isBoss and Color3.fromRGB(255,215,0) or Color3.fromRGB(255,120,120)
+    nameL.TextStrokeTransparency = 0.3; nameL.TextScaled = true
+    nameL.Font = Enum.Font.GothamBold; nameL.Parent = bg
 
-    -- Info label: HP numbers + distance (updated by the update loop below)
     local infoL = Instance.new("TextLabel")
-    infoL.Size                   = UDim2.new(1,-4,0.30,0)
-    infoL.Position               = UDim2.new(0,2,0.42,0)
-    infoL.BackgroundTransparency = 1
-    infoL.TextColor3             = Color3.fromRGB(220,220,220)
-    infoL.TextStrokeTransparency = 0.35
-    infoL.TextStrokeColor3       = Color3.fromRGB(0,0,0)
-    infoL.TextScaled             = true
-    infoL.Font                   = Enum.Font.Gotham
-    infoL.Parent                 = bg
+    infoL.Size = UDim2.new(1,-4,0.30,0); infoL.Position = UDim2.new(0,2,0.42,0)
+    infoL.BackgroundTransparency = 1; infoL.TextColor3 = Color3.fromRGB(220,220,220)
+    infoL.TextStrokeTransparency = 0.35; infoL.TextScaled = true
+    infoL.Font = Enum.Font.Gotham; infoL.Parent = bg
 
-    -- HP bar background
     local hpBg = Instance.new("Frame")
-    hpBg.Size             = UDim2.new(1,-6,0,8)
-    hpBg.Position         = UDim2.new(0,3,1,-13)
-    hpBg.BackgroundColor3 = Color3.fromRGB(30,30,30)
-    hpBg.BorderSizePixel  = 0
-    hpBg.Parent           = bg
-    local hpBgC = Instance.new("UICorner"); hpBgC.CornerRadius = UDim.new(1,0); hpBgC.Parent = hpBg
+    hpBg.Size = UDim2.new(1,-6,0,8); hpBg.Position = UDim2.new(0,3,1,-13)
+    hpBg.BackgroundColor3 = Color3.fromRGB(30,30,30); hpBg.BorderSizePixel = 0; hpBg.Parent = bg
+    Instance.new("UICorner", hpBg).CornerRadius = UDim.new(1,0)
 
-    -- HP bar fill (width updated by loop)
     local hpFill = Instance.new("Frame")
-    hpFill.Size             = UDim2.new(1,0,1,0)
-    hpFill.BackgroundColor3 = Color3.fromRGB(0,200,80)
-    hpFill.BorderSizePixel  = 0
-    hpFill.Parent           = hpBg
-    local hpFillC = Instance.new("UICorner"); hpFillC.CornerRadius = UDim.new(1,0); hpFillC.Parent = hpFill
+    hpFill.Size = UDim2.new(1,0,1,0); hpFill.BackgroundColor3 = Color3.fromRGB(0,200,80)
+    hpFill.BorderSizePixel = 0; hpFill.Parent = hpBg
+    Instance.new("UICorner", hpFill).CornerRadius = UDim.new(1,0)
 
-    espCache[model] = {
-        hl       = hl,
-        bb       = bb,
-        infoL    = infoL,
-        hpFill   = hpFill,
-        eHum     = eHum,
-        rootPart = rootP,
-    }
+    espCache[model] = { hl=hl, bb=bb, infoL=infoL, hpFill=hpFill, eHum=eHum, rootPart=rootP }
 end
 
--- ESP scan: discovers new mobs, culls dead ones (every 0.5s is fine for this)
 task.spawn(function()
     while task.wait(0.5) do
         if not espEnabled then
-            -- STAGGERED cleanup → no single-frame lag spike on toggle off
             local toKill = {}
             for m in pairs(espCache) do table.insert(toKill, m) end
             for i, m in ipairs(toKill) do
                 destroyESP(m)
-                if i % 5 == 0 then task.wait() end  -- yield every 5 deletions
+                if i % 5 == 0 then task.wait() end
             end
             continue
         end
-
         local root = workspace:FindFirstChild("Areas") or workspace
         local seen = {}
-
         for _, m in ipairs(root:GetDescendants()) do
             if m:IsA("Model") and allMobSet[m.Name] and isEnemy(m) then
                 local eHum = m:FindFirstChildOfClass("Humanoid")
@@ -466,34 +425,22 @@ task.spawn(function()
                 end
             end
         end
-
-        -- Cull models that died or left
         for m in pairs(espCache) do
             if not seen[m] then destroyESP(m) end
         end
     end
 end)
 
--- ESP label update: refreshes HP bar + text every 0.1s
--- Separated from scan so toggling off the scan doesn't stutter the updates
 task.spawn(function()
     while task.wait(0.1) do
         if not espEnabled then continue end
         for model, d in pairs(espCache) do
-            if not model.Parent or not d.eHum.Parent then
-                destroyESP(model)
-                continue
-            end
-
+            if not model.Parent or not d.eHum.Parent then destroyESP(model); continue end
             local hp    = math.floor(d.eHum.Health)
             local maxHp = math.floor(d.eHum.MaxHealth)
             local dist  = math.floor((hrp.Position - d.rootPart.Position).Magnitude)
-            local pct   = math.clamp(hp / math.max(maxHp, 1), 0, 1)
-
-            -- Update text: HP numbers + distance
+            local pct   = math.clamp(hp / math.max(maxHp,1), 0, 1)
             d.infoL.Text = string.format("HP: %d / %d  |  %d studs", hp, maxHp, dist)
-
-            -- Update HP bar width + colour (green → orange → red)
             d.hpFill.Size = UDim2.new(pct, 0, 1, 0)
             if pct > 0.6 then
                 d.hpFill.BackgroundColor3 = Color3.fromRGB(0,200,80)
@@ -511,9 +458,9 @@ end)
 -- ══════════════════════════════════════════════════════════
 local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
 local Window = Rayfield:CreateWindow({
-    Name              = "Autofarm v2",
+    Name              = "Autofarm v3",
     LoadingTitle      = "Loading...",
-    LoadingSubtitle   = "No Damage | Fixed Ore/Wood | Better ESP",
+    LoadingSubtitle   = "Direct Remote — Instant, No Twitch",
     ConfigurationSaving = { Enabled = false },
     KeySystem         = false
 })
@@ -526,19 +473,57 @@ local TabWood   = Window:CreateTab("Auto Wood")
 local TabExtras = Window:CreateTab("Extras")
 local TabESP    = Window:CreateTab("Mob ESP")
 
--- ── Info Tab ───────────────────────────────────────────────
-TabInfo:CreateParagraph({ Title = "v2 — What Changed", Content =
-    "FIX: No Damage — HP reset loop active during auto kill\n" ..
-    "FIX: Auto Ore — nil PrimaryPart no longer skips the target\n" ..
-    "FIX: Auto Ore — now searches full workspace, not just Areas\n" ..
-    "FIX: Auto Wood — same fixes + Oak/Redwood/Spruce alt names added\n" ..
-    "FIX: ESP toggle lag — staggered cleanup, no frame spike\n" ..
-    "NEW: ESP shows HP bar (color coded), HP/MaxHP, distance\n" ..
-    "NEW: ESP boss indicator — orange highlight + [BOSS] tag\n" ..
-    "NEW: No Damage standalone toggle in Combat tab"
+TabInfo:CreateParagraph({ Title = "v3 — What Changed", Content =
+    "Combat fires DamageDone remote directly = instant, no twitch\n" ..
+    "Resources fire ResourceDamageDone directly = no delay\n" ..
+    "Resources read from workspace.ResourceSpawns (their real path)\n" ..
+    "Real no-damage: enemies die before they can hit you\n" ..
+    "'Teleport to target' is now OPTIONAL (default OFF = no twitch)\n" ..
+    "Turn it ON only if enemies/resources don't take damage from range"
+})
+TabInfo:CreateParagraph({ Title = "If something doesn't work", Content =
+    "Enemies not dying from range → enable 'Teleport to target' in Combat\n" ..
+    "Resources not breaking → enable 'Teleport to target'\n" ..
+    "Getting kicked/banned → turn OFF 'Instant Kill' (uses lethal damage)\n" ..
+    "Still taking damage during a boss → that boss may need its own remote;\n" ..
+    "capture it with rSpy and I'll add it"
 })
 
--- ── Auto Ore Tab ───────────────────────────────────────────
+-- Combat
+TabCombat:CreateSection("Combat Settings")
+TabCombat:CreateToggle({
+    Name = "Instant Kill (lethal damage)", CurrentValue = true, Flag = "InstaKill",
+    Callback = function(v) instantKill = v end
+})
+TabCombat:CreateToggle({
+    Name = "Teleport to target (only if needed)", CurrentValue = false, Flag = "TPTarget",
+    Callback = function(v) tpToTarget = v end
+})
+TabCombat:CreateToggle({
+    Name = "No Cooldown", CurrentValue = false, Flag = "NoCooldown",
+    Callback = function(v) noCooldown = v; hookCooldowns(char) end
+})
+TabCombat:CreateToggle({
+    Name = "Client HP Reset (backup, may be visual)", CurrentValue = false, Flag = "HPLoop",
+    Callback = function(v) healthLoop = v end
+})
+
+TabCombat:CreateSection("Auto Kill Targets")
+local allEnemyList = {}
+for _, v in ipairs(mobNames)  do table.insert(allEnemyList, v) end
+for _, v in ipairs(bossNames) do table.insert(allEnemyList, v) end
+for _, name in ipairs(allEnemyList) do
+    TabCombat:CreateToggle({
+        Name = "Kill " .. name, CurrentValue = false, Flag = "Kill_" .. name,
+        Callback = function(val)
+            selEnemies[name] = val or nil
+            autoKill = next(selEnemies) ~= nil
+            if val then autoOre = false; autoWood = false end
+        end
+    })
+end
+
+-- Auto Ore
 TabOre:CreateSection("Select Ore to Mine")
 for _, ore in ipairs(oreNames) do
     TabOre:CreateToggle({
@@ -551,109 +536,55 @@ for _, ore in ipairs(oreNames) do
     })
 end
 
--- ── Teleports Tab ──────────────────────────────────────────
-TabTPs:CreateSection("Locations")
-for _, v in ipairs(tpList) do
-    TabTPs:CreateButton({ Name = v[1], Callback = function()
-        hrp.Anchored = true
-        hrp.CFrame   = CFrame.new(v[2])
-        task.wait(0.3)
-        hrp.Anchored = false
-    end})
-end
-TabTPs:CreateSection("Boss Locations")
-for _, v in ipairs(bossTPList) do
-    TabTPs:CreateButton({ Name = v[1], Callback = function()
-        hrp.Anchored = true
-        hrp.CFrame   = CFrame.new(v[2])
-        task.wait(0.3)
-        hrp.Anchored = false
-    end})
-end
-
--- ── Combat Tab ─────────────────────────────────────────────
-TabCombat:CreateSection("Modifiers")
-TabCombat:CreateToggle({
-    Name = "No Cooldown", CurrentValue = false, Flag = "NoCooldown",
-    Callback = function(val)
-        noCooldown = val
-        hookCooldowns(char)
-    end
-})
-TabCombat:CreateToggle({
-    -- Standalone toggle: no-damage outside of auto kill (e.g. boss fights)
-    Name = "No Damage (standalone)", CurrentValue = false, Flag = "NoDamage",
-    Callback = function(val) noDamage = val end
-})
-
-TabCombat:CreateSection("Auto Kill Targets")
-local allEnemyList = {}
-for _, v in ipairs(mobNames)  do table.insert(allEnemyList, v) end
-for _, v in ipairs(bossNames) do table.insert(allEnemyList, v) end
-
-for _, name in ipairs(allEnemyList) do
-    TabCombat:CreateToggle({
-        Name = "Kill " .. name, CurrentValue = false, Flag = "Kill_" .. name,
-        Callback = function(val)
-            selEnemies[name] = val or nil
-            autoKill = next(selEnemies) ~= nil
-            if val then autoOre = false; autoWood = false end
-        end
-    })
-end
-
--- ── Auto Wood Tab ──────────────────────────────────────────
+-- Auto Wood
 TabWood:CreateSection("Select Wood to Chop")
 local woodDisplay = {"Oak Stump", "Redwood Stump", "Spruce Stump"}
 for _, w in ipairs(woodDisplay) do
     TabWood:CreateToggle({
         Name = w, CurrentValue = false, Flag = "Wood_" .. w,
         Callback = function(val)
-            -- Register canonical stump name + bare name + tree name variant
             local base = w:gsub(" Stump", "")
-            selWood[w]                 = val or nil
-            selWood[base]              = val or nil
-            selWood[base .. " Tree"]   = val or nil
+            selWood[w]               = val or nil
+            selWood[base]            = val or nil
+            selWood[base .. " Tree"] = val or nil
             autoWood = next(selWood) ~= nil
             if val then autoOre = false; autoKill = false end
         end
     })
 end
 
--- ── Extras Tab ─────────────────────────────────────────────
-TabExtras:CreateSection("Character")
-TabExtras:CreateSlider({
-    Name = "WalkSpeed", Range = {16, 250}, Increment = 1,
-    CurrentValue = 16, Flag = "WS",
-    Callback = function(v) hum.WalkSpeed = v end
-})
-TabExtras:CreateSlider({
-    Name = "JumpPower", Range = {50, 350}, Increment = 1,
-    CurrentValue = 50, Flag = "JP",
-    Callback = function(v) hum.JumpPower = v end
-})
-TabExtras:CreateToggle({
-    Name = "Infinite Jump", CurrentValue = false, Flag = "InfJump",
-    Callback = function(v) infiniteJump = v end
-})
+-- Teleports
+TabTPs:CreateSection("Locations")
+for _, v in ipairs(tpList) do
+    TabTPs:CreateButton({ Name = v[1], Callback = function()
+        hrp.Anchored = true; hrp.CFrame = CFrame.new(v[2]); task.wait(0.3); hrp.Anchored = false
+    end})
+end
+TabTPs:CreateSection("Boss Locations")
+for _, v in ipairs(bossTPList) do
+    TabTPs:CreateButton({ Name = v[1], Callback = function()
+        hrp.Anchored = true; hrp.CFrame = CFrame.new(v[2]); task.wait(0.3); hrp.Anchored = false
+    end})
+end
 
+-- Extras
+TabExtras:CreateSection("Character")
+TabExtras:CreateSlider({ Name = "WalkSpeed", Range = {16,250}, Increment = 1, CurrentValue = 16, Flag = "WS",
+    Callback = function(v) hum.WalkSpeed = v end })
+TabExtras:CreateSlider({ Name = "JumpPower", Range = {50,350}, Increment = 1, CurrentValue = 50, Flag = "JP",
+    Callback = function(v) hum.JumpPower = v end })
+TabExtras:CreateToggle({ Name = "Infinite Jump", CurrentValue = false, Flag = "InfJump",
+    Callback = function(v) infiniteJump = v end })
 UIS.JumpRequest:Connect(function()
-    if infiniteJump and hum and hum.Health > 0 then
-        hum:ChangeState(Enum.HumanoidStateType.Jumping)
-    end
+    if infiniteJump and hum and hum.Health > 0 then hum:ChangeState(Enum.HumanoidStateType.Jumping) end
 end)
 
--- ── ESP Tab ────────────────────────────────────────────────
+-- ESP
 TabESP:CreateSection("Mob Highlight ESP")
-TabESP:CreateToggle({
-    Name = "Enable ESP", CurrentValue = false, Flag = "ESP",
-    Callback = function(v) espEnabled = v end
-})
+TabESP:CreateToggle({ Name = "Enable ESP", CurrentValue = false, Flag = "ESP",
+    Callback = function(v) espEnabled = v end })
 TabESP:CreateParagraph({ Title = "ESP Details", Content =
-    "Shows all live enemies inside the Areas folder\n" ..
-    "• HP bar: green (>60%) / orange (30-60%) / red (<30%)\n" ..
-    "• HP/MaxHP numbers + distance in studs\n" ..
-    "• Bosses: orange highlight + [BOSS] label\n" ..
-    "• Highlight shows through walls (AlwaysOnTop)\n" ..
-    "• Toggle lag fixed: cleanup staggered over multiple frames"
+    "HP bar (green/orange/red) + HP numbers + distance\n" ..
+    "Bosses: orange highlight + [BOSS] tag\n" ..
+    "Shows through walls; toggle cleanup is staggered (no lag)"
 })

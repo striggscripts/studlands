@@ -1,16 +1,14 @@
 -- ============================================================
---  Autofarm Script v4 — Smart-Avoid + Death Recovery Edition
+--  Autofarm Script v5 — Stability Pass
 -- ============================================================
--- NEW IN v4 (from your Dex enemy-structure findings):
---  • Smart-Avoid: reads enemy Stats.AttackRange live and stands just
---    outside it (tunable buffer). Falls back to fixed offset if unreadable.
---  • Death Recovery: records your farm position; on death it re-equips,
---    TPs back to where you died, then WAITS for the area to stream in
---    (until a target loads, 12s cap) before resuming. Handles far/unloaded
---    enemies after respawning in town.
---  • Anti-Aggro (experimental): tries clearing CurrentClosestPlayer.
---  Carried over: UseItem-based attacks, ResourceSpawns fast scan,
---  no-twitch positioning, ESP with HP bar / distance / boss tag.
+-- FIXES OVER v4:
+--  • Re-equip after death now RETRIES and waits for the backpack to load
+--    (no more empty-hand standing around). ensureEquipped() is robust + cheap.
+--  • Lag fix: target scan is throttled/cached (0.25s) and idle loop slowed
+--    from 33Hz to 10Hz. No more 33x/sec GetDescendants on Areas.
+--  • Recovery race fixed: the farm loop stays paused for the ENTIRE recovery
+--    (equip -> TP back -> wait for stream-in), then resumes. No fighting.
+--  • AttackRange cached per target instead of read every swing.
 -- ============================================================
 
 local Players = game:GetService("Players")
@@ -22,39 +20,27 @@ local char   = player.Character or player.CharacterAdded:Wait()
 local hrp    = char:WaitForChild("HumanoidRootPart")
 local hum    = char:WaitForChild("Humanoid")
 
--- ── Remote references ──────────────────────────────────────
+-- ── Remotes ────────────────────────────────────────────────
 local ClientRemotes = RS:WaitForChild("ClientRemotes")
 local UseItem   = ClientRemotes:WaitForChild("Character"):WaitForChild("UseItem")
 local EquipItem = ClientRemotes:WaitForChild("Inventory"):WaitForChild("EquipItem")
 
--- ── State flags ────────────────────────────────────────────
-local autoOre      = false
-local autoWood     = false
-local autoKill     = false
-local noCooldown   = false
-local infiniteJump = false
-local espEnabled   = false
-local smartAvoid   = true   -- use enemy AttackRange to position
-local deathRecover = true   -- respawn -> re-equip -> TP back -> resume
-local antiAggro    = false  -- experimental CurrentClosestPlayer clearing
+-- ── State ──────────────────────────────────────────────────
+local autoOre, autoWood, autoKill = false, false, false
+local noCooldown, infiniteJump, espEnabled = false, false, false
+local smartAvoid, deathRecover, antiAggro = true, true, false
 
--- Tunable positioning
-local atkBehind = 5     -- fallback studs behind enemy (when no AttackRange)
-local atkHeight = 7     -- studs above enemy
-local avoidBuffer = 2   -- studs added beyond AttackRange in smart mode
-local swingDelay = 0.04 -- seconds between UseItem fires
+local atkBehind, atkHeight, avoidBuffer = 5, 7, 2
+local swingDelay = 0.04
 local repositionThreshold = 4
 
--- Death-recovery bookkeeping
-local lastFarmPos = nil    -- updated continuously while farming
-local needRecover = false  -- set true by Died, consumed by CharacterAdded
+local lastFarmPos = nil
+local needRecover = false   -- true = farm loop paused while recovering
 
-local selOres    = {}
-local selWood    = {}
-local selEnemies = {}
-local espCache   = {}
+local selOres, selWood, selEnemies = {}, {}, {}
+local espCache = {}
 
--- ── Content lists ──────────────────────────────────────────
+-- ── Lists ──────────────────────────────────────────────────
 local oreNames = {
     "Iron","Gold","Magnetite","Dark Geode","Ice","Rock","Diamond",
     "Salt Rock","Meteorite","Jade","Blood Stone","Sapphire",
@@ -77,33 +63,24 @@ local bossNames = {
     "Duke Cublindor","Jimbee","Pharaoh's Curse","Musheynator",
     "Enormous Ballzo","Glacier Giant","Lord Cublindor","Blazing Jimbee","Orbdenier"
 }
-
-local bossSet   = {}; for _, b in ipairs(bossNames) do bossSet[b]   = true end
+local bossSet = {}; for _, b in ipairs(bossNames) do bossSet[b] = true end
 local allMobSet = {}
 for _, m in ipairs(mobNames)  do allMobSet[m] = true end
 for _, b in ipairs(bossNames) do allMobSet[b] = true end
 
 local tpList = {
-    {"Home",     Vector3.new(-591,-351,-195)},
-    {"Forest",   Vector3.new(-819,-175,-1623)},
-    {"Plains",   Vector3.new(-591,-349,-679)},
-    {"Flowey",   Vector3.new(-30,-350,-1132)},
-    {"Redwood",  Vector3.new(-1222,-353,-622)},
-    {"Ballzone", Vector3.new(188,-361,83)},
-    {"Wretched", Vector3.new(-2731,-269,-522)},
-    {"Cherry",   Vector3.new(727,-166,-2528)},
-    {"Mushey",   Vector3.new(-1930,-292,-361)},
-    {"Tundra",   Vector3.new(-1809,15,-2327)},
-    {"Desert",   Vector3.new(258,-269,1200)},
-    {"Grotto",   Vector3.new(708,-343,-2687)},
-    {"Silly",    Vector3.new(2139,-1481,-367)}
+    {"Home",Vector3.new(-591,-351,-195)},{"Forest",Vector3.new(-819,-175,-1623)},
+    {"Plains",Vector3.new(-591,-349,-679)},{"Flowey",Vector3.new(-30,-350,-1132)},
+    {"Redwood",Vector3.new(-1222,-353,-622)},{"Ballzone",Vector3.new(188,-361,83)},
+    {"Wretched",Vector3.new(-2731,-269,-522)},{"Cherry",Vector3.new(727,-166,-2528)},
+    {"Mushey",Vector3.new(-1930,-292,-361)},{"Tundra",Vector3.new(-1809,15,-2327)},
+    {"Desert",Vector3.new(258,-269,1200)},{"Grotto",Vector3.new(708,-343,-2687)},
+    {"Silly",Vector3.new(2139,-1481,-367)}
 }
 local bossTPList = {
-    {"Duke",        Vector3.new(-7262,-1346,230)},
-    {"Jimbee",      Vector3.new(-2474,-2186,-4439)},
-    {"Pharaoh",     Vector3.new(-3972,-1528,2630)},
-    {"Musheynator", Vector3.new(-1787,-322,11)},
-    {"Ice Giant",   Vector3.new(-2030,-65,-2006)}
+    {"Duke",Vector3.new(-7262,-1346,230)},{"Jimbee",Vector3.new(-2474,-2186,-4439)},
+    {"Pharaoh",Vector3.new(-3972,-1528,2630)},{"Musheynator",Vector3.new(-1787,-322,11)},
+    {"Ice Giant",Vector3.new(-2030,-65,-2006)}
 }
 
 -- ── No-cooldown hook ───────────────────────────────────────
@@ -123,7 +100,7 @@ end
 
 -- ── Helpers ────────────────────────────────────────────────
 local function getRootPart(obj)
-    if obj:IsA("Model")    then return obj.PrimaryPart or obj:FindFirstChildOfClass("BasePart")
+    if obj:IsA("Model") then return obj.PrimaryPart or obj:FindFirstChildOfClass("BasePart")
     elseif obj:IsA("BasePart") then return obj end
     return nil
 end
@@ -139,18 +116,14 @@ local function isEnemy(model)
     return false
 end
 
--- Read an enemy's AttackRange from its Stats folder (number, or nil)
 local function getAttackRange(enemyModel)
     local stats = enemyModel:FindFirstChild("Stats")
     if not stats then return nil end
     local ar = stats:FindFirstChild("AttackRange")
-    if ar and ar:IsA("ValueBase") then
-        return tonumber(ar.Value)
-    end
+    if ar and ar:IsA("ValueBase") then return tonumber(ar.Value) end
     return nil
 end
 
--- Experimental: try to drop the enemy's lock on the player
 local function tryAntiAggro(enemyModel)
     if not antiAggro then return end
     local ccp = enemyModel:FindFirstChild("CurrentClosestPlayer")
@@ -160,45 +133,60 @@ local function tryAntiAggro(enemyModel)
     end
 end
 
--- Equip a tool by name via the server remote, return the live Tool
-local function equipAndGet(toolType)
-    local kw
+-- Tool keyword matcher
+local function toolKeywords(toolType)
     if toolType == "weapon" then
-        kw = {"sword","cleaver","blade","dagger","katana","machete","scythe","knife","rapier"}
+        return {"sword","cleaver","blade","dagger","katana","machete","scythe","knife","rapier"}
     elseif toolType == "pickaxe" then
-        kw = {"pick","pickaxe","drill","mattock","mine"}
-    elseif toolType == "axe" then
-        kw = {"axe","hatchet","chop","lumber"}
+        return {"pick","pickaxe","drill","mattock","mine"}
+    else
+        return {"axe","hatchet","chop","lumber"}
     end
-    local function matches(name)
-        name = name:lower()
-        for _, k in ipairs(kw) do if name:find(k) then return true end end
-        return false
-    end
+end
 
+local function nameMatches(name, kw)
+    name = name:lower()
+    for _, k in ipairs(kw) do if name:find(k) then return true end end
+    return false
+end
+
+-- Pick the best tool NAME to equip for a tool type
+local function pickToolName(toolType)
+    local kw = toolKeywords(toolType)
     local cur = char:FindFirstChildOfClass("Tool")
-    if cur and matches(cur.Name) then return cur end
-
-    local pick
+    if cur and nameMatches(cur.Name, kw) then return cur.Name end
     for _, t in ipairs(char:GetChildren()) do
-        if t:IsA("Tool") and matches(t.Name) then pick = t.Name; break end
+        if t:IsA("Tool") and nameMatches(t.Name, kw) then return t.Name end
     end
-    if not pick then
-        for _, t in ipairs(player.Backpack:GetChildren()) do
-            if t:IsA("Tool") and matches(t.Name) then pick = t.Name; break end
-        end
+    for _, t in ipairs(player.Backpack:GetChildren()) do
+        if t:IsA("Tool") and nameMatches(t.Name, kw) then return t.Name end
     end
-    if not pick then
-        if cur then return cur end
-        local fb = player.Backpack:FindFirstChildOfClass("Tool")
-        if fb then pick = fb.Name end
-    end
-    if not pick then return nil end
+    if cur then return cur.Name end
+    local fb = player.Backpack:FindFirstChildOfClass("Tool")
+    if fb then return fb.Name end
+    return nil
+end
 
-    pcall(function() EquipItem:InvokeServer(pick) end)
-    local tool = char:FindFirstChild(pick)
-    if not tool then task.wait(0.05); tool = char:FindFirstChild(pick) end
-    return tool
+-- ROBUST equip: cheap when already holding the right tool, retries otherwise
+local function ensureEquipped(toolType)
+    local kw = toolKeywords(toolType)
+    local cur = char:FindFirstChildOfClass("Tool")
+    if cur and nameMatches(cur.Name, kw) then return cur end  -- fast path
+
+    local name = pickToolName(toolType)
+    if not name then return cur end
+
+    -- already in hand under that name?
+    local have = char:FindFirstChild(name)
+    if have and have:IsA("Tool") then return have end
+
+    for _ = 1, 3 do
+        pcall(function() EquipItem:InvokeServer(name) end)
+        local t = char:FindFirstChild(name)
+        if t then return t end
+        task.wait(0.08)
+    end
+    return char:FindFirstChild(name) or char:FindFirstChildOfClass("Tool")
 end
 
 local function swing(tool)
@@ -206,8 +194,8 @@ local function swing(tool)
     pcall(function() UseItem:FireServer(tool, false, nil, nil, 0.6) end)
 end
 
--- ── Target scanners ────────────────────────────────────────
-local function getMobTargets()
+-- ── Scanners (with light caching to cut lag) ───────────────
+local function scanMobs()
     local list = {}
     local root = workspace:FindFirstChild("Areas") or workspace
     for _, obj in ipairs(root:GetDescendants()) do
@@ -222,7 +210,7 @@ local function getMobTargets()
     return list
 end
 
-local function getResourceTargets(selTable)
+local function scanResources(selTable)
     local list = {}
     local spawns = workspace:FindFirstChild("ResourceSpawns")
     if not spawns then return list end
@@ -242,6 +230,19 @@ local function getResourceTargets(selTable)
     return list
 end
 
+local cacheList, cacheTime, cacheKey = nil, 0, nil
+local function getTargets(mode)
+    if cacheList and cacheKey == mode and (os.clock() - cacheTime) < 0.25 then
+        return cacheList
+    end
+    local list
+    if mode == "mob" then list = scanMobs()
+    elseif mode == "wood" then list = scanResources(selWood)
+    else list = scanResources(selOres) end
+    cacheList, cacheTime, cacheKey = list, os.clock(), mode
+    return list
+end
+
 local function getClosest(list)
     local best, bestD = nil, math.huge
     for _, t in ipairs(list) do
@@ -253,13 +254,17 @@ local function getClosest(list)
     return best
 end
 
--- Desired standing CFrame
-local function desiredMobCFrame(enemyModel, part)
+local function anyTargetLoaded()
+    if autoKill then return #scanMobs() > 0
+    elseif autoWood then return #scanResources(selWood) > 0
+    elseif autoOre then return #scanResources(selOres) > 0 end
+    return false
+end
+
+-- ── Positioning ────────────────────────────────────────────
+local function desiredMobCFrame(part, cachedRange)
     local horiz = atkBehind
-    if smartAvoid then
-        local ar = getAttackRange(enemyModel)
-        if ar then horiz = ar + avoidBuffer end
-    end
+    if smartAvoid and cachedRange then horiz = cachedRange + avoidBuffer end
     local pos = (part.CFrame * CFrame.new(0, atkHeight, horiz)).Position
     return CFrame.new(pos, part.Position)
 end
@@ -280,16 +285,9 @@ end
 local function setupDeathWatch(humanoid)
     humanoid.Died:Connect(function()
         if deathRecover and (autoKill or autoOre or autoWood) and lastFarmPos then
-            needRecover = true
+            needRecover = true   -- pause farm loop until recovery finishes
         end
     end)
-end
-
-local function anyTargetLoaded()
-    if autoKill then return #getMobTargets() > 0
-    elseif autoWood then return #getResourceTargets(selWood) > 0
-    elseif autoOre then return #getResourceTargets(selOres) > 0 end
-    return false
 end
 
 player.CharacterAdded:Connect(function(c)
@@ -300,26 +298,40 @@ player.CharacterAdded:Connect(function(c)
     setupDeathWatch(hum)
 
     if needRecover and lastFarmPos and (autoKill or autoOre or autoWood) then
-        needRecover = false
         task.spawn(function()
-            task.wait(1.5) -- let character + tools settle
-            -- re-equip happens automatically in the farm loop; force one now too
-            equipAndGet(autoKill and "weapon" or (autoWood and "axe" or "pickaxe"))
-            -- TP back to where we died
+            local toolType = autoKill and "weapon" or (autoWood and "axe" or "pickaxe")
+
+            -- 1) wait for the backpack/tools to actually load in (up to 6s)
+            local t0 = os.clock()
+            while os.clock() - t0 < 6 do
+                if char:FindFirstChildOfClass("Tool") or player.Backpack:FindFirstChildOfClass("Tool") then break end
+                task.wait(0.1)
+            end
+
+            -- 2) re-equip (robust, retries)
+            ensureEquipped(toolType)
+
+            -- 3) TP back to where we died
             local back = lastFarmPos
             pcall(function()
                 hrp.CFrame = CFrame.new(back)
                 hrp.AssemblyLinearVelocity = Vector3.zero
             end)
-            -- Wait for the area to stream in: until a target loads, 12s cap
-            local t0 = os.clock()
-            while os.clock() - t0 < 12 do
+
+            -- 4) wait for the area to stream in (until a target loads, 12s cap)
+            local s0 = os.clock()
+            while os.clock() - s0 < 12 do
                 if anyTargetLoaded() then break end
-                pcall(function() hrp.CFrame = CFrame.new(back) end) -- hold the spot
+                pcall(function() hrp.CFrame = CFrame.new(back) end)
                 task.wait(0.5)
             end
-            -- farm loop resumes on its own
+
+            -- 5) make sure we're still equipped after streaming, then resume
+            ensureEquipped(toolType)
+            needRecover = false
         end)
+    else
+        needRecover = false
     end
 end)
 hookCooldowns(char)
@@ -327,24 +339,21 @@ setupDeathWatch(hum)
 
 -- ── Main farm loop ─────────────────────────────────────────
 task.spawn(function()
-    while task.wait(0.03) do
+    while task.wait(0.1) do          -- idle scan at 10Hz (was 33Hz) -> less lag
         if not (autoKill or autoWood or autoOre) then continue end
-        if needRecover then continue end -- pause while recovery runs
+        if needRecover then continue end
 
         local isMob = autoKill
         local toolType = autoKill and "weapon" or (autoWood and "axe" or "pickaxe")
+        local mode = autoKill and "mob" or (autoWood and "wood" or "ore")
 
-        local targets
-        if autoKill then targets = getMobTargets()
-        elseif autoWood then targets = getResourceTargets(selWood)
-        else targets = getResourceTargets(selOres) end
-
-        local target = getClosest(targets)
+        local target = getClosest(getTargets(mode))
         if not target then continue end
 
         local obj  = target.obj
         local part = target.part
-        local tool = equipAndGet(toolType)
+        local tool = ensureEquipped(toolType)
+        local cachedRange = isMob and getAttackRange(obj) or nil  -- read once per target
 
         local guard = 0
         local maxGuard = isMob and 200 or 400
@@ -358,17 +367,15 @@ task.spawn(function()
                 tryAntiAggro(obj)
             end
 
-            holdPosition(isMob and desiredMobCFrame(obj, part) or desiredResCFrame(part))
-
-            -- record farm position for death recovery
+            holdPosition(isMob and desiredMobCFrame(part, cachedRange) or desiredResCFrame(part))
             lastFarmPos = hrp.Position
 
+            -- cheap: only re-equips if the tool actually left our hand
             if not (tool and tool.Parent == char) then
-                tool = equipAndGet(toolType)
+                tool = ensureEquipped(toolType)
             end
 
             swing(tool)
-
             task.wait(swingDelay)
             guard += 1
         end
@@ -394,13 +401,11 @@ local function buildESP(model)
     local isBoss = bossSet[model.Name] ~= nil
 
     local hl = Instance.new("Highlight")
-    hl.Adornee             = model
-    hl.FillColor           = isBoss and Color3.fromRGB(255,130,0) or Color3.fromRGB(200,30,30)
-    hl.OutlineColor        = isBoss and Color3.fromRGB(255,210,0) or Color3.fromRGB(255,255,255)
-    hl.FillTransparency    = 0.45
-    hl.OutlineTransparency = 0
-    hl.DepthMode           = Enum.HighlightDepthMode.AlwaysOnTop
-    hl.Parent              = workspace
+    hl.Adornee = model
+    hl.FillColor = isBoss and Color3.fromRGB(255,130,0) or Color3.fromRGB(200,30,30)
+    hl.OutlineColor = isBoss and Color3.fromRGB(255,210,0) or Color3.fromRGB(255,255,255)
+    hl.FillTransparency = 0.45; hl.OutlineTransparency = 0
+    hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop; hl.Parent = workspace
 
     local bb = Instance.new("BillboardGui")
     bb.Size = UDim2.new(0,160,0,72); bb.StudsOffset = Vector3.new(0,4.5,0)
@@ -488,9 +493,9 @@ end)
 -- ══════════════════════════════════════════════════════════
 local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
 local Window = Rayfield:CreateWindow({
-    Name = "Autofarm v4",
+    Name = "Autofarm v5",
     LoadingTitle = "Loading...",
-    LoadingSubtitle = "Smart-Avoid | Death Recovery",
+    LoadingSubtitle = "Stable | Re-equip fixed | Less lag",
     ConfigurationSaving = { Enabled = false },
     KeySystem = false
 })
@@ -503,44 +508,38 @@ local TabWood   = Window:CreateTab("Auto Wood")
 local TabExtras = Window:CreateTab("Extras")
 local TabESP    = Window:CreateTab("Mob ESP")
 
-TabInfo:CreateParagraph({ Title = "v4 — What Changed", Content =
-    "• Smart-Avoid reads enemy Stats.AttackRange and stands just outside it\n" ..
-    "• Death Recovery: re-equip + TP back to death spot + wait for stream-in\n" ..
-    "• Anti-Aggro (experimental) tries clearing CurrentClosestPlayer\n" ..
-    "• Damage is server-side, so true 'no damage' = avoid + recover, not a block"
+TabInfo:CreateParagraph({ Title = "v5 — Stability Pass", Content =
+    "• Re-equip after death retries + waits for backpack to load (no empty hand)\n" ..
+    "• Lag fix: target scan cached 0.25s, idle loop slowed to 10Hz\n" ..
+    "• Recovery no longer fights the farm loop (stays paused until done)\n" ..
+    "• AttackRange read once per target instead of every swing"
 })
 
 -- Auto Ore
 TabOre:CreateSection("Select Ore")
 for _, ore in ipairs(oreNames) do
-    TabOre:CreateToggle({ Name = "Mine "..ore, CurrentValue = false, Flag = "Ore_"..ore,
-        Callback = function(v)
-            selOres[ore] = v or nil
-            autoOre = next(selOres) ~= nil
-            if v then autoWood=false; autoKill=false end
-        end })
+    TabOre:CreateToggle({ Name = "Mine "..ore, CurrentValue=false, Flag="Ore_"..ore,
+        Callback=function(v) selOres[ore]=v or nil; autoOre=next(selOres)~=nil
+            if v then autoWood=false; autoKill=false end end })
 end
 
 -- Teleports
 TabTPs:CreateSection("Locations")
 for _, v in ipairs(tpList) do
     TabTPs:CreateButton({ Name=v[1], Callback=function()
-        hrp.Anchored=true; hrp.CFrame=CFrame.new(v[2]); task.wait(0.3); hrp.Anchored=false
-    end})
+        hrp.Anchored=true; hrp.CFrame=CFrame.new(v[2]); task.wait(0.3); hrp.Anchored=false end})
 end
 TabTPs:CreateSection("Boss Locations")
 for _, v in ipairs(bossTPList) do
     TabTPs:CreateButton({ Name=v[1], Callback=function()
-        hrp.Anchored=true; hrp.CFrame=CFrame.new(v[2]); task.wait(0.3); hrp.Anchored=false
-    end})
+        hrp.Anchored=true; hrp.CFrame=CFrame.new(v[2]); task.wait(0.3); hrp.Anchored=false end})
 end
 
 -- Combat
 TabCombat:CreateParagraph({ Title = "No-Damage = Avoid + Recover", Content =
-    "Health is server-authoritative (no damage remote exists), so you can't BLOCK damage. " ..
-    "Smart-Avoid keeps you outside each enemy's AttackRange; Death Recovery instantly " ..
-    "puts you back farming if something does kill you. Tune the sliders if a weapon can't " ..
-    "reach from outside AttackRange (lower the buffer / raise height)."
+    "Damage is server-side (no remote to block). Smart-Avoid stands you outside the " ..
+    "enemy's AttackRange; Death Recovery re-equips + TPs you back if you die. Lower the " ..
+    "Avoid Buffer if your weapon can't reach from out there."
 })
 TabCombat:CreateSection("Avoidance")
 TabCombat:CreateToggle({ Name="Smart-Avoid (use AttackRange)", CurrentValue=smartAvoid, Flag="Smart",
@@ -552,7 +551,7 @@ TabCombat:CreateSlider({ Name="Attack Height (up)", Range={0,25}, Increment=1, C
 TabCombat:CreateSlider({ Name="Fallback Distance (behind)", Range={2,15}, Increment=1, CurrentValue=atkBehind, Flag="AtkB",
     Callback=function(v) atkBehind=v end })
 TabCombat:CreateSlider({ Name="Swing Delay (sec)", Range={0,0.2}, Increment=0.01, CurrentValue=swingDelay, Flag="SwD",
-    Callback=function(v) swingDelay = math.max(v, 0) end })
+    Callback=function(v) swingDelay=math.max(v,0) end })
 
 TabCombat:CreateSection("Survival")
 TabCombat:CreateToggle({ Name="Death Recovery (re-equip + TP back)", CurrentValue=deathRecover, Flag="Recover",
@@ -570,11 +569,8 @@ for _, v in ipairs(mobNames)  do table.insert(allEnemyList, v) end
 for _, v in ipairs(bossNames) do table.insert(allEnemyList, v) end
 for _, name in ipairs(allEnemyList) do
     TabCombat:CreateToggle({ Name="Kill "..name, CurrentValue=false, Flag="Kill_"..name,
-        Callback=function(v)
-            selEnemies[name] = v or nil
-            autoKill = next(selEnemies) ~= nil
-            if v then autoOre=false; autoWood=false end
-        end })
+        Callback=function(v) selEnemies[name]=v or nil; autoKill=next(selEnemies)~=nil
+            if v then autoOre=false; autoWood=false end end })
 end
 
 -- Auto Wood
@@ -582,11 +578,10 @@ TabWood:CreateSection("Select Wood")
 for _, w in ipairs({"Oak Stump","Redwood Stump","Spruce Stump"}) do
     TabWood:CreateToggle({ Name=w, CurrentValue=false, Flag="Wood_"..w,
         Callback=function(v)
-            local base = w:gsub(" Stump","")
+            local base=w:gsub(" Stump","")
             selWood[w]=v or nil; selWood[base]=v or nil; selWood[base.." Tree"]=v or nil
-            autoWood = next(selWood) ~= nil
-            if v then autoOre=false; autoKill=false end
-        end })
+            autoWood=next(selWood)~=nil
+            if v then autoOre=false; autoKill=false end end })
 end
 
 -- Extras

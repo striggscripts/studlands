@@ -51,23 +51,38 @@ local oreNames = {
     "Salt Rock","Meteorite","Jade","Blood Stone","Sapphire",
     "Amethyst","Obsidian","Shroomium","Sandstone"
 }
+-- Full roster from the Studlands wiki (Regular #1 + #2) + seasonal + legacy
+-- names. Sorted alphabetically below via table.sort. Bosses are separate.
 local mobNames = {
-    "Cubey","Wedgey","Field Mousey","Flying Goldfish","Wooden Mimic","Dummy","Target Dummy",
-    "Cavey","Spidey","Bonezo","Cave Spidey","Sentient Assault Rifle","Mini Cubey",
-    "Mini Bomb","Cubey Mage","Ghostey","Buney","Cublin","Cublin Warrior",
-    "Cublin Brute","Angry Wasp","Redwood Mimic","Flowey","Blooming Flowey",
-    "Fire Flowey","Darktainium Miner","Parawalker","Watchstalker",
-    "Pestililypadey","Scorpion","Tumblezo","Mousey","Vampiric Outlaw",
-    "Rustey","Solar Elemental","Frost Buney","Snowdeerey","Ice Lizardey",
-    "Icy Snail","Firefly","Living Berry Bush","Cylindery","Ballzo","Ballzo Warrior",
-    "Frogey","Mushey","Browncapey","Swamp Hydrey","Lilypadey","Spikezo",
-    "Enormous Ballzo","Coconut Crab","Moai","Crab Champion","El Espinoso",
-    "Prickley","Pumpkiney","Viney","Pumpkinpadey"
+    -- Regular #1
+    "Wedgey","Mini Cubey","Field Mousey","Buney","Cubey","Cubee","Strawberrey",
+    "Blueberrey","Cubey Mage","Mushey","Cavey","Wooden Mimic","Bombey","Bonezo",
+    "Fire Flowey","Bombee","Ballzo","Bumblecubee","Spidey","Firefly","Tumblezo",
+    "Prickley","Ghostey","Cublin","Cubey Bandit","Ballzo Warrior","Petalith",
+    "Redwood Mimic","Bell Flowey","Bluecapey","Flowey","Mousey","Cublin Warrior",
+    "Bloom Mimic","Frogey","Frost Buney","Angry Wasp","Coconut Crab","Cylindery",
+    "Blooming Flowey","Mystic Mimic","Flying Goldfish","Fremlin","Cublin Brute",
+    "Big Mushman","Snowdeerey","Honey Mimic","Gnome","Living Berry Bush",
+    "Cave Spidey","Mini Leafy","Rogue Cubey","Eclipsed Ghostey","Floral Turtley",
+    -- Regular #2 (non-boss)
+    "Swamp Hydrey","Scorpion","Roadkillzo","Mushmasher","Stoney","Lilypadey",
+    "Ice Lizardey","Vampiric Outlaw","Coghead","Browncapey","Solar Elemental",
+    "Mini Tankzo","Watchstalker","Flying Archerfish","Awakened Swamp Hydrey",
+    "Blossom Keeper","Pestililypadey","Rustey","Icy Snail","El Espinoso",
+    "Shockbox","Parawalker","Vampiric Druid","Wraithhorn","Moai","Eruption Furnace",
+    -- Seasonal / event
+    "Pumpkiney","Pumpkinpadey","Spikezo","Viney",
+    -- Training dummies + legacy names (harmless if not present in your game)
+    "Dummy","Target Dummy","Sentient Assault Rifle","Mini Bomb","Darktainium Miner"
 }
 local bossNames = {
-    "Duke Cublindor","Jimbee","Pharaoh's Curse","Musheynator",
-    "Enormous Ballzo","Glacier Giant","Lord Cublindor","Blazing Jimbee","Orbdenier"
+    "Duke Cublindor","Jimbee","Enormous Ballzo","Musheynator",
+    "Crab Champion","Pharaoh's Curse","Glacier Giant","Orbdenier"
 }
+
+-- Alphabetical ordering for the UI
+table.sort(mobNames)
+table.sort(bossNames)
 
 local bossSet   = {}; for _, b in ipairs(bossNames) do bossSet[b]   = true end
 local allMobSet = {}
@@ -473,9 +488,9 @@ end)
 -- ══════════════════════════════════════════════════════════
 local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
 local Window = Rayfield:CreateWindow({
-    Name = "Autofarm v8",
+    Name = "Autofarm v9",
     LoadingTitle = "Loading...",
-    LoadingSubtitle = "Performance fix",
+    LoadingSubtitle = "Full enemy roster",
     ConfigurationSaving = { Enabled = false },
     KeySystem = false
 })
@@ -488,10 +503,12 @@ local TabWood   = Window:CreateTab("Auto Wood")
 local TabExtras = Window:CreateTab("Extras")
 local TabESP    = Window:CreateTab("Mob ESP")
 
-TabInfo:CreateParagraph({ Title = "v8 — Performance", Content =
-    "Lag spikes fixed: target scan now reads only the Enemies folders, not\n" ..
-    "the entire map. Teleport sits closer to the enemy. A stall-breaker drops\n" ..
-    "any mob that isn't taking damage so the character won't just stand there."
+TabInfo:CreateParagraph({ Title = "v9 - Full Roster", Content =
+    "Added every enemy from the Studlands wiki (Regular #1 + #2), plus seasonal
+" ..
+    "and legacy names. Bosses are now in their own section and both lists are
+" ..
+    "alphabetical. Combat tab: 'Normal Enemies' then 'Bosses'."
 })
 
 -- Auto Ore
@@ -528,11 +545,8 @@ TabCombat:CreateSection("Modifiers")
 TabCombat:CreateToggle({ Name="No Cooldown", CurrentValue=false, Flag="NoCooldown",
     Callback=function(v) noCooldown=v end })
 
-TabCombat:CreateSection("Auto Kill Targets")
-local allEnemyList = {}
-for _, v in ipairs(mobNames)  do table.insert(allEnemyList, v) end
-for _, v in ipairs(bossNames) do table.insert(allEnemyList, v) end
-for _, name in ipairs(allEnemyList) do
+-- shared callback builder for kill toggles
+local function makeKillToggle(name)
     TabCombat:CreateToggle({ Name="Kill "..name, CurrentValue=false, Flag="Kill_"..name,
         Callback=function(v)
             selEnemies[name] = v or nil
@@ -540,6 +554,12 @@ for _, name in ipairs(allEnemyList) do
             if v then autoOre=false; autoWood=false end
         end })
 end
+
+TabCombat:CreateSection("Auto Kill - Normal Enemies")
+for _, name in ipairs(mobNames) do makeKillToggle(name) end
+
+TabCombat:CreateSection("Auto Kill - Bosses")
+for _, name in ipairs(bossNames) do makeKillToggle(name) end
 
 -- Auto Wood
 TabWood:CreateSection("Select Wood")

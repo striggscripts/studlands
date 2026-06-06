@@ -1,3 +1,16 @@
+-- ============================================================
+--  Autofarm Script v9 — Full Roster Edition (Studlands)
+-- ============================================================
+-- NEW IN v9:
+--  • Enemy/ore lists expanded from the Studlands wiki, sorted alphabetically
+--  • Bosses split into their own section (also alphabetical)
+--  • "Kill ALL / Mine ALL / Chop ALL" master toggles — match by folder
+--    membership so nothing is missed even if a name differs slightly
+--  • Ore toggles register name variants (bare / " Ore" / " Vein")
+-- Carried over: cheap enemy-folder scan (no map-wide lag), held-item equip
+--  with per-mode re-equip, world-space teleport, death recovery, No Cooldown.
+-- ============================================================
+
 local Players = game:GetService("Players")
 local UIS     = game:GetService("UserInputService")
 local RS      = game:GetService("ReplicatedStorage")
@@ -14,15 +27,16 @@ local EquipItem = ClientRemotes:WaitForChild("Inventory"):WaitForChild("EquipIte
 
 -- ── State ──────────────────────────────────────────────────
 local autoOre, autoWood, autoKill = false, false, false
+local mineAll, chopAll, killAll   = false, false, false
 local noCooldown, infiniteJump, espEnabled = false, false, false
 local deathRecover = true
 
 local SWING_DELAY = 0.05
-local MOB_OFFSET = Vector3.new(0, 1.5, 2)   -- closer to the mob (~2.5 studs)
+local MOB_OFFSET = Vector3.new(0, 1.5, 2)
 local RES_OFFSET = Vector3.new(0, 2, 2.5)
 local TARGET_MOVE_RETP = 3
 local FELL_AWAY_RETP   = 7
-local STALL_SECONDS    = 4                    -- drop a mob if no dmg landed this long
+local STALL_SECONDS    = 4
 
 local lastFarmPos = nil
 local needRecover = false
@@ -31,49 +45,34 @@ local lastEquipped = {}
 local selOres, selWood, selEnemies = {}, {}, {}
 local espCache = {}
 
--- ── Content lists ──────────────────────────────────────────
+-- ── Content lists (alphabetical) ───────────────────────────
 local oreNames = {
-    "Iron","Gold","Magnetite","Dark Geode","Ice","Rock","Diamond",
-    "Salt Rock","Meteorite","Jade","Blood Stone","Sapphire",
-    "Amethyst","Obsidian","Shroomium","Sandstone"
-}
--- Full roster from the Studlands wiki (Regular #1 + #2) + seasonal + legacy
--- names. Sorted alphabetically below via table.sort. Bosses are separate.
-local mobNames = {
-    -- Regular #1
-    "Wedgey","Mini Cubey","Field Mousey","Buney","Cubey","Cubee","Strawberrey",
-    "Blueberrey","Cubey Mage","Mushey","Cavey","Wooden Mimic","Bombey","Bonezo",
-    "Fire Flowey","Bombee","Ballzo","Bumblecubee","Spidey","Firefly","Tumblezo",
-    "Prickley","Ghostey","Cublin","Cubey Bandit","Ballzo Warrior","Petalith",
-    "Redwood Mimic","Bell Flowey","Bluecapey","Flowey","Mousey","Cublin Warrior",
-    "Bloom Mimic","Frogey","Frost Buney","Angry Wasp","Coconut Crab","Cylindery",
-    "Blooming Flowey","Mystic Mimic","Flying Goldfish","Fremlin","Cublin Brute",
-    "Big Mushman","Snowdeerey","Honey Mimic","Gnome","Living Berry Bush",
-    "Cave Spidey","Mini Leafy","Rogue Cubey","Eclipsed Ghostey","Floral Turtley",
-    -- Regular #2 (non-boss)
-    "Swamp Hydrey","Scorpion","Roadkillzo","Mushmasher","Stoney","Lilypadey",
-    "Ice Lizardey","Vampiric Outlaw","Coghead","Browncapey","Solar Elemental",
-    "Mini Tankzo","Watchstalker","Flying Archerfish","Awakened Swamp Hydrey",
-    "Blossom Keeper","Pestililypadey","Rustey","Icy Snail","El Espinoso",
-    "Shockbox","Parawalker","Vampiric Druid","Wraithhorn","Moai","Eruption Furnace",
-    -- Seasonal / event
-    "Pumpkiney","Pumpkinpadey","Spikezo","Viney",
-    -- Training dummies + legacy names (harmless if not present in your game)
-    "Dummy","Target Dummy","Sentient Assault Rifle","Mini Bomb","Darktainium Miner"
-}
-local bossNames = {
-    "Duke Cublindor","Jimbee","Enormous Ballzo","Musheynator",
-    "Crab Champion","Pharaoh's Curse","Glacier Giant","Orbdenier"
+    "Amethyst","Blood Stone","Copper","Dark Geode","Darktainium","Diamond",
+    "Emerald","Gold","Ice","Iron","Jade","Magnetite","Meteorite","Obsidian",
+    "Platinum","Rock","Salt Rock","Sandstone","Sapphire","Shroomium","Tin","Valerion"
 }
 
--- Alphabetical ordering for the UI
-table.sort(mobNames)
-table.sort(bossNames)
+local woodNames = { "Oak Stump","Redwood Stump","Spruce Stump" }
 
-local bossSet   = {}; for _, b in ipairs(bossNames) do bossSet[b]   = true end
-local allMobSet = {}
-for _, m in ipairs(mobNames)  do allMobSet[m] = true end
-for _, b in ipairs(bossNames) do allMobSet[b] = true end
+local regularEnemies = {
+    "Angry Wasp","Ballzo","Ballzo Warrior","Bell Flowey","Blooming Flowey","Bonezo",
+    "Browncapey","Buney","Cave Spidey","Cavey","Coconut Crab","Crab Champion","Cubey",
+    "Cubey Mage","Cublin","Cublin Brute","Cublin Warrior","Cylindery","Darktainium Miner",
+    "Dummy","El Espinoso","Field Mousey","Fire Flowey","Firefly","Floral Turtley","Flowey",
+    "Flying Goldfish","Frogey","Frost Buney","Ghostey","Ice Lizardey","Icy Snail","Lilypadey",
+    "Living Berry Bush","Mini Bomb","Mini Cubey","Moai","Mousey","Mushey","Mystic Mimic",
+    "Parawalker","Pestililypadey","Prickley","Pumpkiney","Pumpkinpadey","Redwood Mimic",
+    "Rustey","Scorpion","Sentient Assault Rifle","Snowdeerey","Solar Elemental","Spidey",
+    "Spikezo","Stoney","Swamp Hydrey","Target Dummy","Tumblezo","Vampiric Druid",
+    "Vampiric Outlaw","Viney","Watchstalker","Wedgey","Wooden Mimic","Wraithhorn Scorpion"
+}
+
+local bossEnemies = {
+    "Blazing Jimbee","Duke Cublindor","Enormous Ballzo","Glacier Giant","Jimbee",
+    "Lord Cublindor","Musheynator","Orbdenier","Pharaoh's Curse"
+}
+
+local bossSet = {}; for _, b in ipairs(bossEnemies) do bossSet[b] = true end
 
 local tpList = {
     {"Home",     Vector3.new(-591,-351,-195)},
@@ -103,6 +102,10 @@ local function getRootPart(obj)
     if obj:IsA("Model")    then return obj.PrimaryPart or obj:FindFirstChildOfClass("BasePart")
     elseif obj:IsA("BasePart") then return obj end
     return nil
+end
+
+local function isWoodName(nm)
+    return nm:find("Stump") ~= nil or nm:find("Tree") ~= nil or nm:find("Log") ~= nil
 end
 
 local CHAR_PART = {
@@ -178,7 +181,7 @@ task.spawn(function()
     end
 end)
 
--- ── Enemy folder collection (PERF: avoids whole-map scan) ──
+-- ── Enemy folders (cheap; never the whole map) ─────────────
 local function collectEnemyFolders()
     local folders = {}
     local areas = workspace:FindFirstChild("Areas")
@@ -200,11 +203,14 @@ local function getMobTargets()
     local list = {}
     for _, folder in ipairs(collectEnemyFolders()) do
         for _, obj in ipairs(folder:GetChildren()) do
-            if obj:IsA("Model") and selEnemies[obj.Name] then
-                local eHum = obj:FindFirstChildOfClass("Humanoid")
-                local part = getRootPart(obj)
-                if eHum and eHum.Health > 0 and part then
-                    list[#list+1] = {obj=obj, part=part, hum=eHum}
+            if obj:IsA("Model") then
+                local include = killAll or selEnemies[obj.Name]
+                if include then
+                    local eHum = obj:FindFirstChildOfClass("Humanoid")
+                    local part = getRootPart(obj)
+                    if eHum and eHum.Health > 0 and part then
+                        list[#list+1] = {obj=obj, part=part, hum=eHum}
+                    end
                 end
             end
         end
@@ -212,7 +218,8 @@ local function getMobTargets()
     return list
 end
 
-local function getResourceTargets(selTable)
+-- kind = "ore" or "wood"
+local function getResourceTargets(kind)
     local list = {}
     local spawns = workspace:FindFirstChild("ResourceSpawns")
     if not spawns then return list end
@@ -221,7 +228,14 @@ local function getResourceTargets(selTable)
             local cr = node:FindFirstChild("CurrentResources")
             if cr then
                 for _, res in ipairs(cr:GetChildren()) do
-                    if selTable[res.Name] then
+                    local nm = res.Name
+                    local include = false
+                    if kind == "ore" then
+                        if mineAll then include = not isWoodName(nm) else include = selOres[nm] == true end
+                    else
+                        if chopAll then include = isWoodName(nm) else include = selWood[nm] == true end
+                    end
+                    if include then
                         local part = getRootPart(res)
                         if part then list[#list+1] = {obj=res, part=part} end
                     end
@@ -243,13 +257,20 @@ local function getClosest(list)
     return best
 end
 
+-- ── Active-flag recompute ──────────────────────────────────
+local function recompute()
+    autoKill = killAll or (next(selEnemies) ~= nil)
+    autoOre  = mineAll or (next(selOres) ~= nil)
+    autoWood = chopAll or (next(selWood) ~= nil)
+end
+
 -- ── Death recovery ─────────────────────────────────────────
 local function farmingActive() return autoKill or autoOre or autoWood end
 
 local function anyTargetLoaded()
     if autoKill then return #getMobTargets() > 0
-    elseif autoWood then return #getResourceTargets(selWood) > 0
-    elseif autoOre then return #getResourceTargets(selOres) > 0 end
+    elseif autoWood then return #getResourceTargets("wood") > 0
+    elseif autoOre then return #getResourceTargets("ore") > 0 end
     return false
 end
 
@@ -305,8 +326,8 @@ task.spawn(function()
 
             local targets
             if autoKill then targets = getMobTargets()
-            elseif autoWood then targets = getResourceTargets(selWood)
-            else targets = getResourceTargets(selOres) end
+            elseif autoWood then targets = getResourceTargets("wood")
+            else targets = getResourceTargets("ore") end
 
             local target = getClosest(targets)
             if not target then task.wait(0.25); return end
@@ -315,8 +336,6 @@ task.spawn(function()
             local offset = isMob and MOB_OFFSET or RES_OFFSET
             local anchorPos = nil
             local guard, maxGuard = 0, (isMob and 220 or 420)
-
-            -- stall tracking (drop a mob that isn't taking damage)
             local lastHP, stallT = nil, os.clock()
 
             ensureEquipped(mode)
@@ -328,14 +347,12 @@ task.spawn(function()
                 if isMob then
                     local eHum = target.hum or obj:FindFirstChildOfClass("Humanoid")
                     if not eHum or eHum.Health <= 0 then break end
-                    -- stall-breaker
                     local h = eHum.Health
                     if lastHP == nil then lastHP = h end
                     if h < lastHP then lastHP = h; stallT = os.clock() end
                     if os.clock() - stallT > STALL_SECONDS then break end
                 end
 
-                -- WORLD-space teleport, only when target moves / we fall away
                 local desired = part.Position + offset
                 if (not anchorPos)
                    or (anchorPos - desired).Magnitude > TARGET_MOVE_RETP
@@ -361,7 +378,7 @@ task.spawn(function()
 end)
 
 -- ═══════════════════════════════════════════════════════════
---  ESP (also uses the cheap enemy-folder scan)
+--  ESP (highlights ALL enemies in enemy folders)
 -- ═══════════════════════════════════════════════════════════
 local function destroyESP(model)
     local d = espCache[model]
@@ -442,7 +459,7 @@ task.spawn(function()
         local seen = {}
         for _, folder in ipairs(collectEnemyFolders()) do
             for _, m in ipairs(folder:GetChildren()) do
-                if m:IsA("Model") and allMobSet[m.Name] then
+                if m:IsA("Model") then
                     local eHum = m:FindFirstChildOfClass("Humanoid")
                     if eHum and eHum.Health > 0 then seen[m] = true; buildESP(m) end
                 end
@@ -476,7 +493,7 @@ local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
 local Window = Rayfield:CreateWindow({
     Name = "Autofarm v9",
     LoadingTitle = "Loading...",
-    LoadingSubtitle = "Full enemy roster",
+    LoadingSubtitle = "Full roster + master toggles",
     ConfigurationSaving = { Enabled = false },
     KeySystem = false
 })
@@ -489,26 +506,31 @@ local TabWood   = Window:CreateTab("Auto Wood")
 local TabExtras = Window:CreateTab("Extras")
 local TabESP    = Window:CreateTab("Mob ESP")
 
-TabInfo:CreateParagraph({ Title = "v9 - Full Roster", Content =
-    "Added every enemy from the Studlands wiki (Regular #1 + #2), plus seasonal
-" ..
-    "and legacy names. Bosses are now in their own section and both lists are
-" ..
-    "alphabetical. Combat tab: 'Normal Enemies' then 'Bosses'."
+TabInfo:CreateParagraph({ Title = "v9 — Full Roster", Content =
+    "Enemy & ore lists expanded from the Studlands wiki, alphabetical, bosses\n" ..
+    "in their own section. Master toggles (Kill/Mine/Chop ALL) match by folder\n" ..
+    "so nothing is missed even if a name differs. Kill mode takes priority if\n" ..
+    "multiple modes are on."
 })
 
--- Auto Ore
+-- ── Auto Ore ───────────────────────────────────────────────
+TabOre:CreateSection("Master")
+TabOre:CreateToggle({ Name="Mine ALL Ores", CurrentValue=false, Flag="MineAll",
+    Callback=function(v)
+        mineAll = v
+        if v then chopAll=false; killAll=false end
+        recompute()
+    end })
 TabOre:CreateSection("Select Ore")
 for _, ore in ipairs(oreNames) do
     TabOre:CreateToggle({ Name = "Mine "..ore, CurrentValue = false, Flag = "Ore_"..ore,
         Callback = function(v)
-            selOres[ore] = v or nil
-            autoOre = next(selOres) ~= nil
-            if v then autoWood=false; autoKill=false end
+            for _, n in ipairs({ ore, ore.." Ore", ore.." Vein" }) do selOres[n] = v or nil end
+            recompute()
         end })
 end
 
--- Teleports
+-- ── Teleports ──────────────────────────────────────────────
 TabTPs:CreateSection("Locations")
 for _, v in ipairs(tpList) do
     TabTPs:CreateButton({ Name=v[1], Callback=function()
@@ -522,44 +544,52 @@ for _, v in ipairs(bossTPList) do
     end})
 end
 
--- Combat (lean)
+-- ── Combat ─────────────────────────────────────────────────
 TabCombat:CreateSection("Survival")
 TabCombat:CreateToggle({ Name="Death Recovery (re-equip + TP back)", CurrentValue=deathRecover, Flag="Recover",
     Callback=function(v) deathRecover=v end })
-
-TabCombat:CreateSection("Modifiers")
 TabCombat:CreateToggle({ Name="No Cooldown", CurrentValue=false, Flag="NoCooldown",
     Callback=function(v) noCooldown=v end })
 
--- shared callback builder for kill toggles
-local function makeKillToggle(name)
+TabCombat:CreateSection("Master")
+TabCombat:CreateToggle({ Name="Kill ALL Enemies", CurrentValue=false, Flag="KillAll",
+    Callback=function(v)
+        killAll = v
+        if v then mineAll=false; chopAll=false end
+        recompute()
+    end })
+
+TabCombat:CreateSection("Bosses")
+for _, name in ipairs(bossEnemies) do
     TabCombat:CreateToggle({ Name="Kill "..name, CurrentValue=false, Flag="Kill_"..name,
-        Callback=function(v)
-            selEnemies[name] = v or nil
-            autoKill = next(selEnemies) ~= nil
-            if v then autoOre=false; autoWood=false end
-        end })
+        Callback=function(v) selEnemies[name] = v or nil; recompute() end })
 end
 
-TabCombat:CreateSection("Auto Kill - Normal Enemies")
-for _, name in ipairs(mobNames) do makeKillToggle(name) end
+TabCombat:CreateSection("Regular Enemies")
+for _, name in ipairs(regularEnemies) do
+    TabCombat:CreateToggle({ Name="Kill "..name, CurrentValue=false, Flag="Kill_"..name,
+        Callback=function(v) selEnemies[name] = v or nil; recompute() end })
+end
 
-TabCombat:CreateSection("Auto Kill - Bosses")
-for _, name in ipairs(bossNames) do makeKillToggle(name) end
-
--- Auto Wood
+-- ── Auto Wood ──────────────────────────────────────────────
+TabWood:CreateSection("Master")
+TabWood:CreateToggle({ Name="Chop ALL Wood", CurrentValue=false, Flag="ChopAll",
+    Callback=function(v)
+        chopAll = v
+        if v then mineAll=false; killAll=false end
+        recompute()
+    end })
 TabWood:CreateSection("Select Wood")
-for _, w in ipairs({"Oak Stump","Redwood Stump","Spruce Stump"}) do
+for _, w in ipairs(woodNames) do
     TabWood:CreateToggle({ Name=w, CurrentValue=false, Flag="Wood_"..w,
         Callback=function(v)
             local base = w:gsub(" Stump","")
-            selWood[w]=v or nil; selWood[base]=v or nil; selWood[base.." Tree"]=v or nil
-            autoWood = next(selWood) ~= nil
-            if v then autoOre=false; autoKill=false end
+            for _, n in ipairs({ w, base, base.." Tree", base.." Tree Stump" }) do selWood[n] = v or nil end
+            recompute()
         end })
 end
 
--- Extras
+-- ── Extras ─────────────────────────────────────────────────
 TabExtras:CreateSection("Character")
 TabExtras:CreateSlider({ Name="WalkSpeed", Range={16,250}, Increment=1, CurrentValue=16, Flag="WS",
     Callback=function(v) hum.WalkSpeed=v end })
@@ -571,9 +601,9 @@ UIS.JumpRequest:Connect(function()
     if infiniteJump and hum and hum.Health>0 then hum:ChangeState(Enum.HumanoidStateType.Jumping) end
 end)
 
--- ESP
+-- ── ESP ────────────────────────────────────────────────────
 TabESP:CreateSection("Mob Highlight ESP")
 TabESP:CreateToggle({ Name="Enable ESP", CurrentValue=false, Flag="ESP",
     Callback=function(v) espEnabled=v end })
 TabESP:CreateParagraph({ Title="ESP Details", Content=
-    "HP bar (green/orange/red), HP/MaxHP, distance.\nBosses = orange + [BOSS] tag. Shows through walls." })
+    "Highlights every enemy in the area. HP bar, HP/MaxHP, distance.\nBosses = orange + [BOSS] tag. Shows through walls." })

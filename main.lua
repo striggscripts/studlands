@@ -1,13 +1,12 @@
 -- ============================================================
---  Autofarm Script v6 — Stripped Combat Edition
+--  Autofarm Script v7 — Equip + Teleport Rebuild
 -- ============================================================
--- Combat is now minimal:
---   • Death Recovery (re-equip + TP back to where you died)
---   • No Cooldown (active loop zeroes Cooldown/Debounce values)
---   • Auto Kill target list
--- Removed: smart-avoid, stable mode, anti-aggro, all positioning sliders.
--- Equip is detected by tool type (weapon/pickaxe/axe) and fired through
--- your EquipItem remote with whatever the tool is named — nothing hardcoded.
+-- EQUIP: items here are Character children (Model/Tool with a Handle),
+--   NOT Backpack Tools. We grab whatever is actually held, remember its
+--   name per activity, and re-equip that name via your EquipItem remote.
+-- TELEPORT: fixed WORLD-space offset from the target's position (no more
+--   orbiting from enemy rotation); only re-teleports when the target moves.
+-- Combat kept lean: Death Recovery, No Cooldown, Auto Kill list.
 -- ============================================================
 
 local Players = game:GetService("Players")
@@ -25,19 +24,19 @@ local UseItem   = ClientRemotes:WaitForChild("Character"):WaitForChild("UseItem"
 local EquipItem = ClientRemotes:WaitForChild("Inventory"):WaitForChild("EquipItem")
 
 -- ── State ──────────────────────────────────────────────────
-local autoOre      = false
-local autoWood     = false
-local autoKill     = false
-local noCooldown   = false
-local infiniteJump = false
-local espEnabled   = false
+local autoOre, autoWood, autoKill = false, false, false
+local noCooldown, infiniteJump, espEnabled = false, false, false
 local deathRecover = true
 
-local SWING_DELAY = 0.03        -- fixed attack rate
-local REPOS_THRESH = 4          -- only re-teleport if drifted this far
+local SWING_DELAY = 0.05
+local MOB_OFFSET = Vector3.new(0, 2, 3)     -- world-space, near the mob
+local RES_OFFSET = Vector3.new(0, 2.5, 3)   -- world-space, near the resource
+local TARGET_MOVE_RETP = 3                    -- re-TP if target moved this far
+local FELL_AWAY_RETP   = 7                    -- re-TP if we ended up this far
 
 local lastFarmPos = nil
 local needRecover = false
+local lastEquipped = {}   -- [mode] = item name we had equipped
 
 local selOres, selWood, selEnemies = {}, {}, {}
 local espCache = {}
@@ -112,60 +111,70 @@ local function isEnemy(model)
     return false
 end
 
--- Tool detection by type (NOT by hardcoded name)
-local TOOL_KW = {
-    weapon  = {"sword","cleaver","blade","dagger","katana","machete","scythe","knife","rapier"},
-    pickaxe = {"pick","pickaxe","drill","mattock","mine"},
-    axe     = {"axe","hatchet","chop","lumber"},
+-- Standard character parts to ignore when hunting for the held item
+local CHAR_PART = {
+    Humanoid=true, HumanoidRootPart=true, Head=true, Torso=true, UpperTorso=true, LowerTorso=true,
+    ["Left Arm"]=true, ["Right Arm"]=true, ["Left Leg"]=true, ["Right Leg"]=true,
+    LeftUpperArm=true, LeftLowerArm=true, LeftHand=true, RightUpperArm=true, RightLowerArm=true, RightHand=true,
+    LeftUpperLeg=true, LeftLowerLeg=true, LeftFoot=true, RightUpperLeg=true, RightLowerLeg=true, RightFoot=true,
+    Animate=true, ["Body Colors"]=true, Health=true,
 }
-local function toolMatches(name, toolType)
-    name = name:lower()
-    for _, k in ipairs(TOOL_KW[toolType] or {}) do
-        if name:find(k) then return true end
+
+local function isHeldItem(c)
+    if CHAR_PART[c.Name] then return false end
+    if c:IsA("Humanoid") or c:IsA("LuaSourceContainer") or c:IsA("Shirt") or c:IsA("Pants")
+       or c:IsA("BodyColors") or c:IsA("Accessory") or c:IsA("Folder") or c:IsA("ValueBase")
+       or c:IsA("Sound") or c:IsA("CharacterMesh") or c:IsA("Decal") then
+        return false
     end
+    if c:IsA("Tool") then return true end
+    if c:IsA("Model") and (c:FindFirstChild("Handle") or c.PrimaryPart) then return true end
+    if c:IsA("BasePart") and c:FindFirstChild("Handle") then return true end
     return false
 end
 
-local function findTool(toolType)
-    local cur = char:FindFirstChildOfClass("Tool")
-    if cur and toolMatches(cur.Name, toolType) then return cur end
-    for _, t in ipairs(char:GetChildren()) do
-        if t:IsA("Tool") and toolMatches(t.Name, toolType) then return t end
-    end
-    for _, t in ipairs(player.Backpack:GetChildren()) do
-        if t:IsA("Tool") and toolMatches(t.Name, toolType) then return t end
-    end
-    if cur then return cur end
-    return player.Backpack:FindFirstChildOfClass("Tool")
-end
-
--- Equip via your EquipItem remote (by detected name) + EquipTool fallback
-local function ensureEquipped(toolType)
-    local cur = char:FindFirstChildOfClass("Tool")
-    local desired = findTool(toolType)
-    if not desired then return cur end
-    if cur and cur.Name == desired.Name and cur.Parent == char then return cur end
-
-    for _ = 1, 3 do
-        pcall(function() EquipItem:InvokeServer(desired.Name) end)
-        local inHand = char:FindFirstChild(desired.Name)
-        if not (inHand and inHand:IsA("Tool")) then
-            local bp = player.Backpack:FindFirstChild(desired.Name)
-            if bp then pcall(function() hum:EquipTool(bp) end) end
-            inHand = char:FindFirstChild(desired.Name)
+-- The item currently held on the character (Tool OR Model w/ Handle)
+local function getEquipped()
+    local fallback
+    for _, c in ipairs(char:GetChildren()) do
+        if isHeldItem(c) then
+            if c:FindFirstChild("Handle") then return c end
+            fallback = fallback or c
         end
-        if inHand and inHand:IsA("Tool") then return inHand end
-        task.wait(0.1)
     end
-    return char:FindFirstChildOfClass("Tool")
+    return fallback
 end
 
-local function swing(tool)
-    if not tool then return end
-    pcall(function() UseItem:FireServer(tool, false, nil, nil, 0.6) end)
+local function currentMode()
+    if autoKill then return "kill"
+    elseif autoWood then return "wood"
+    elseif autoOre then return "ore" end
+    return nil
 end
 
--- ── No Cooldown (active zeroing loop) ──────────────────────
+-- Ensure something is equipped for this mode; remembers/restores by name
+local function ensureEquipped(mode)
+    local eq = getEquipped()
+    if eq then
+        if mode then lastEquipped[mode] = eq.Name end
+        return eq
+    end
+    local name = mode and lastEquipped[mode]
+    if name then
+        for _ = 1, 3 do
+            pcall(function() EquipItem:InvokeServer(name) end)
+            task.wait(0.15)
+            eq = getEquipped()
+            if eq then
+                if mode then lastEquipped[mode] = eq.Name end
+                return eq
+            end
+        end
+    end
+    return getEquipped()
+end
+
+-- ── No Cooldown (active zeroing) ───────────────────────────
 task.spawn(function()
     while task.wait(0.1) do
         if noCooldown and char then
@@ -225,26 +234,8 @@ local function getClosest(list)
     return best
 end
 
--- Simple positioning: next to the target, only re-TP if drifted
-local function desiredCFrame(part, isMob)
-    if isMob then
-        return CFrame.new((part.CFrame * CFrame.new(0, 2, 4)).Position, part.Position)
-    else
-        return CFrame.new(part.Position + Vector3.new(3, 2.5, 0), part.Position)
-    end
-end
-
-local function holdPosition(cf)
-    if (hrp.Position - cf.Position).Magnitude > REPOS_THRESH then
-        hrp.CFrame = cf
-        pcall(function() hrp.AssemblyLinearVelocity = Vector3.zero end)
-    end
-end
-
 -- ── Death recovery ─────────────────────────────────────────
-local function farmingActive()
-    return autoKill or autoOre or autoWood
-end
+local function farmingActive() return autoKill or autoOre or autoWood end
 
 local function anyTargetLoaded()
     if autoKill then return #getMobTargets() > 0
@@ -270,30 +261,26 @@ player.CharacterAdded:Connect(function(c)
     if needRecover and lastFarmPos and farmingActive() then
         needRecover = false
         task.spawn(function()
-            local toolType = autoKill and "weapon" or (autoWood and "axe" or "pickaxe")
+            local mode = currentMode()
+            local back = lastFarmPos
 
-            -- wait for tools to load
-            local t0 = os.clock()
-            while os.clock() - t0 < 5 do
-                if char:FindFirstChildOfClass("Tool") or player.Backpack:FindFirstChildOfClass("Tool") then break end
-                task.wait(0.2)
-            end
+            -- 1) wait for the character to settle
+            task.wait(1)
 
-            -- re-equip (polls until in hand)
+            -- 2) re-equip the remembered item (poll until it's in hand)
             local te = os.clock()
             repeat
-                ensureEquipped(toolType)
-                task.wait(0.15)
-            until char:FindFirstChildOfClass("Tool") or os.clock() - te > 4
+                ensureEquipped(mode)
+                task.wait(0.2)
+            until getEquipped() or os.clock() - te > 5
 
-            -- TP back to where we died
-            local back = lastFarmPos
+            -- 3) TP back to where we died
             pcall(function()
                 hrp.CFrame = CFrame.new(back)
                 hrp.AssemblyLinearVelocity = Vector3.zero
             end)
 
-            -- wait for the area to stream in (until a target loads, 12s cap)
+            -- 4) wait for the area to stream in (until a target loads, 12s)
             local ts = os.clock()
             while os.clock() - ts < 12 do
                 if anyTargetLoaded() then break end
@@ -312,8 +299,8 @@ task.spawn(function()
             if not farmingActive() then task.wait(0.2); return end
             if needRecover then task.wait(0.2); return end
 
+            local mode  = currentMode()
             local isMob = autoKill
-            local toolType = autoKill and "weapon" or (autoWood and "axe" or "pickaxe")
 
             local targets
             if autoKill then targets = getMobTargets()
@@ -324,25 +311,37 @@ task.spawn(function()
             if not target then task.wait(0.25); return end
 
             local obj, part = target.obj, target.part
-            local tool = ensureEquipped(toolType)
-
+            local offset = isMob and MOB_OFFSET or RES_OFFSET
+            local anchorPos = nil
             local guard, maxGuard = 0, (isMob and 220 or 420)
+
+            ensureEquipped(mode)
+
             while obj.Parent and part.Parent and guard < maxGuard do
                 if not farmingActive() then break end
                 if needRecover then break end
-
                 if isMob then
                     local eHum = target.hum or obj:FindFirstChildOfClass("Humanoid")
                     if not eHum or eHum.Health <= 0 then break end
                 end
 
-                holdPosition(desiredCFrame(part, isMob))
+                -- WORLD-space teleport (no orbiting); only when target moves
+                local desired = part.Position + offset
+                if (not anchorPos)
+                   or (anchorPos - desired).Magnitude > TARGET_MOVE_RETP
+                   or (hrp.Position - desired).Magnitude > FELL_AWAY_RETP then
+                    hrp.CFrame = CFrame.new(desired, part.Position)
+                    pcall(function() hrp.AssemblyLinearVelocity = Vector3.zero end)
+                    anchorPos = desired
+                end
                 lastFarmPos = hrp.Position
 
-                if not (tool and tool.Parent == char) then
-                    tool = ensureEquipped(toolType)
+                -- equip (by held item / remembered name) + swing
+                local eq = getEquipped() or ensureEquipped(mode)
+                if eq then
+                    if mode then lastEquipped[mode] = eq.Name end
+                    pcall(function() UseItem:FireServer(eq, false, nil, nil, 0.6) end)
                 end
-                swing(tool)
 
                 task.wait(SWING_DELAY)
                 guard += 1
@@ -465,9 +464,9 @@ end)
 -- ══════════════════════════════════════════════════════════
 local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
 local Window = Rayfield:CreateWindow({
-    Name = "Autofarm v6",
+    Name = "Autofarm v7",
     LoadingTitle = "Loading...",
-    LoadingSubtitle = "Lean combat",
+    LoadingSubtitle = "Equip + Teleport rebuilt",
     ConfigurationSaving = { Enabled = false },
     KeySystem = false
 })
@@ -480,10 +479,12 @@ local TabWood   = Window:CreateTab("Auto Wood")
 local TabExtras = Window:CreateTab("Extras")
 local TabESP    = Window:CreateTab("Mob ESP")
 
-TabInfo:CreateParagraph({ Title = "v6 — Lean", Content =
-    "Combat trimmed to: Death Recovery, No Cooldown, and Auto Kill targets.\n" ..
-    "Equip is auto-detected by tool type and fired through your EquipItem remote.\n" ..
-    "No Cooldown now actively zeroes Cooldown/Debounce values while it's on."
+TabInfo:CreateParagraph({ Title = "v7", Content =
+    "Equip now grabs the item actually held on your character (Model/Tool with\n" ..
+    "a Handle) and re-equips it by name via your EquipItem remote. Teleport uses\n" ..
+    "a fixed world offset from the target so it no longer orbits rotating enemies.\n" ..
+    "TIP: have the correct tool equipped when you start each mode the first time;\n" ..
+    "it's remembered per mode and auto re-equipped after death."
 })
 
 -- Auto Ore

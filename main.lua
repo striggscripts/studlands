@@ -1,17 +1,3 @@
--- ============================================================
---  Autofarm Script v8 — Performance Fix Edition
--- ============================================================
--- KEY FIX: target scanning no longer walks the entire map.
---   v7 called workspace.Areas:GetDescendants() (every brick/tree/building
---   across all areas) which caused periodic CPU freezes -> you stood still
---   and got hit. v8 scans only each area's Enemies / EnemiesToSpawnHere
---   folders (a few dozen objects). Same fix applied to ESP.
--- Also: tighter teleport offset (closer to enemy) and a stall-breaker so a
---   locked mob that isn't taking damage gets dropped instead of standing.
--- Carried over: held-item equip + per-mode re-equip, world-space teleport,
---   death recovery, No Cooldown, lean combat UI.
--- ============================================================
-
 local Players = game:GetService("Players")
 local UIS     = game:GetService("UserInputService")
 local RS      = game:GetService("ReplicatedStorage")

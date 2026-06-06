@@ -1,17 +1,13 @@
 -- ============================================================
---  Autofarm Script v5 — Stable + Robust Equip Edition
+--  Autofarm Script v6 — Stripped Combat Edition
 -- ============================================================
--- FIXES OVER v4:
---  • LAG: idle scans throttled (no more 33Hz GetDescendants when no
---    target is loaded); AttackRange cached per target; whole farm loop
---    wrapped in pcall so one error can't cascade.
---  • EQUIP: robust ensureEquipped() tries EquipItem remote AND standard
---    Humanoid:EquipTool, retries 3x. Death recovery now waits for your
---    tools to load before equipping, then polls until one is in hand.
---  • "WEIRD"/bobbing: Stable Mode anchors the HRP while farming so you
---    sit still (no gravity bob), repositioning only when the enemy moves.
---  Carried over: smart-avoid (AttackRange), death recovery, anti-aggro,
---  ResourceSpawns fast scan, ESP with HP bar / distance / boss tag.
+-- Combat is now minimal:
+--   • Death Recovery (re-equip + TP back to where you died)
+--   • No Cooldown (active loop zeroes Cooldown/Debounce values)
+--   • Auto Kill target list
+-- Removed: smart-avoid, stable mode, anti-aggro, all positioning sliders.
+-- Equip is detected by tool type (weapon/pickaxe/axe) and fired through
+-- your EquipItem remote with whatever the tool is named — nothing hardcoded.
 -- ============================================================
 
 local Players = game:GetService("Players")
@@ -23,38 +19,28 @@ local char   = player.Character or player.CharacterAdded:Wait()
 local hrp    = char:WaitForChild("HumanoidRootPart")
 local hum    = char:WaitForChild("Humanoid")
 
--- ── Remote references ──────────────────────────────────────
+-- ── Remotes ────────────────────────────────────────────────
 local ClientRemotes = RS:WaitForChild("ClientRemotes")
 local UseItem   = ClientRemotes:WaitForChild("Character"):WaitForChild("UseItem")
 local EquipItem = ClientRemotes:WaitForChild("Inventory"):WaitForChild("EquipItem")
 
--- ── State flags ────────────────────────────────────────────
+-- ── State ──────────────────────────────────────────────────
 local autoOre      = false
 local autoWood     = false
 local autoKill     = false
 local noCooldown   = false
 local infiniteJump = false
 local espEnabled   = false
-local smartAvoid   = true
 local deathRecover = true
-local antiAggro    = false
-local stableMode   = true   -- anchor HRP while farming (kills bobbing)
 
--- Tunable
-local atkBehind = 5
-local atkHeight = 7
-local avoidBuffer = 2
-local swingDelay = 0.04
-local repositionThreshold = 4
+local SWING_DELAY = 0.03        -- fixed attack rate
+local REPOS_THRESH = 4          -- only re-teleport if drifted this far
 
--- Death-recovery bookkeeping
 local lastFarmPos = nil
 local needRecover = false
 
-local selOres    = {}
-local selWood    = {}
-local selEnemies = {}
-local espCache   = {}
+local selOres, selWood, selEnemies = {}, {}, {}
+local espCache = {}
 
 -- ── Content lists ──────────────────────────────────────────
 local oreNames = {
@@ -108,21 +94,6 @@ local bossTPList = {
     {"Ice Giant",   Vector3.new(-2030,-65,-2006)}
 }
 
--- ── No-cooldown hook ───────────────────────────────────────
-local function hookCooldowns(c)
-    c.DescendantAdded:Connect(function(d)
-        if d:IsA("NumberValue") and (d.Name:find("Cooldown") or d.Name:find("Debounce")) then
-            d.Changed:Connect(function() if noCooldown then d.Value = 0 end end)
-        end
-    end)
-    for _, d in ipairs(c:GetDescendants()) do
-        if d:IsA("NumberValue") and (d.Name:find("Cooldown") or d.Name:find("Debounce")) then
-            if noCooldown then d.Value = 0 end
-            d.Changed:Connect(function() if noCooldown then d.Value = 0 end end)
-        end
-    end
-end
-
 -- ── Helpers ────────────────────────────────────────────────
 local function getRootPart(obj)
     if obj:IsA("Model")    then return obj.PrimaryPart or obj:FindFirstChildOfClass("BasePart")
@@ -141,30 +112,12 @@ local function isEnemy(model)
     return false
 end
 
-local function getAttackRange(enemyModel)
-    local stats = enemyModel:FindFirstChild("Stats")
-    if not stats then return nil end
-    local ar = stats:FindFirstChild("AttackRange")
-    if ar and ar:IsA("ValueBase") then return tonumber(ar.Value) end
-    return nil
-end
-
-local function tryAntiAggro(enemyModel)
-    if not antiAggro then return end
-    local ccp = enemyModel:FindFirstChild("CurrentClosestPlayer")
-    if ccp and ccp:IsA("ValueBase") then
-        pcall(function() ccp.Value = nil end)
-        pcall(function() ccp.Value = "" end)
-    end
-end
-
--- Keyword sets for tool matching
+-- Tool detection by type (NOT by hardcoded name)
 local TOOL_KW = {
     weapon  = {"sword","cleaver","blade","dagger","katana","machete","scythe","knife","rapier"},
     pickaxe = {"pick","pickaxe","drill","mattock","mine"},
     axe     = {"axe","hatchet","chop","lumber"},
 }
-
 local function toolMatches(name, toolType)
     name = name:lower()
     for _, k in ipairs(TOOL_KW[toolType] or {}) do
@@ -173,7 +126,6 @@ local function toolMatches(name, toolType)
     return false
 end
 
--- Find the best Tool instance for a type (char first, then backpack)
 local function findTool(toolType)
     local cur = char:FindFirstChildOfClass("Tool")
     if cur and toolMatches(cur.Name, toolType) then return cur end
@@ -183,12 +135,11 @@ local function findTool(toolType)
     for _, t in ipairs(player.Backpack:GetChildren()) do
         if t:IsA("Tool") and toolMatches(t.Name, toolType) then return t end
     end
-    -- Fallback: whatever is equipped, else first backpack tool
     if cur then return cur end
     return player.Backpack:FindFirstChildOfClass("Tool")
 end
 
--- Robustly ensure the right tool is equipped; returns the in-hand Tool
+-- Equip via your EquipItem remote (by detected name) + EquipTool fallback
 local function ensureEquipped(toolType)
     local cur = char:FindFirstChildOfClass("Tool")
     local desired = findTool(toolType)
@@ -196,10 +147,8 @@ local function ensureEquipped(toolType)
     if cur and cur.Name == desired.Name and cur.Parent == char then return cur end
 
     for _ = 1, 3 do
-        -- 1) game's own equip remote (by name)
         pcall(function() EquipItem:InvokeServer(desired.Name) end)
         local inHand = char:FindFirstChild(desired.Name)
-        -- 2) standard Roblox equip as fallback
         if not (inHand and inHand:IsA("Tool")) then
             local bp = player.Backpack:FindFirstChild(desired.Name)
             if bp then pcall(function() hum:EquipTool(bp) end) end
@@ -215,6 +164,19 @@ local function swing(tool)
     if not tool then return end
     pcall(function() UseItem:FireServer(tool, false, nil, nil, 0.6) end)
 end
+
+-- ── No Cooldown (active zeroing loop) ──────────────────────
+task.spawn(function()
+    while task.wait(0.1) do
+        if noCooldown and char then
+            for _, d in ipairs(char:GetDescendants()) do
+                if d:IsA("NumberValue") and (d.Name:find("Cooldown") or d.Name:find("Debounce")) then
+                    pcall(function() d.Value = 0 end)
+                end
+            end
+        end
+    end
+end)
 
 -- ── Target scanners ────────────────────────────────────────
 local function getMobTargets()
@@ -263,31 +225,20 @@ local function getClosest(list)
     return best
 end
 
-local function desiredMobCFrame(part, range)
-    local horiz = range or atkBehind
-    local pos = (part.CFrame * CFrame.new(0, atkHeight, horiz)).Position
-    return CFrame.new(pos, part.Position)
-end
-
-local function desiredResCFrame(part)
-    return CFrame.new(part.Position + Vector3.new(3, 2.5, 0), part.Position)
-end
-
-local function setAnchor(state)
-    if hrp and hrp.Anchored ~= state then
-        pcall(function() hrp.Anchored = state end)
+-- Simple positioning: next to the target, only re-TP if drifted
+local function desiredCFrame(part, isMob)
+    if isMob then
+        return CFrame.new((part.CFrame * CFrame.new(0, 2, 4)).Position, part.Position)
+    else
+        return CFrame.new(part.Position + Vector3.new(3, 2.5, 0), part.Position)
     end
 end
 
 local function holdPosition(cf)
-    if (hrp.Position - cf.Position).Magnitude > repositionThreshold then
+    if (hrp.Position - cf.Position).Magnitude > REPOS_THRESH then
         hrp.CFrame = cf
-        pcall(function()
-            hrp.AssemblyLinearVelocity  = Vector3.zero
-            hrp.AssemblyAngularVelocity = Vector3.zero
-        end)
+        pcall(function() hrp.AssemblyLinearVelocity = Vector3.zero end)
     end
-    setAnchor(stableMode)
 end
 
 -- ── Death recovery ─────────────────────────────────────────
@@ -314,7 +265,6 @@ player.CharacterAdded:Connect(function(c)
     char = c
     hrp  = c:WaitForChild("HumanoidRootPart")
     hum  = c:WaitForChild("Humanoid")
-    hookCooldowns(c)
     setupDeathWatch(hum)
 
     if needRecover and lastFarmPos and farmingActive() then
@@ -322,51 +272,44 @@ player.CharacterAdded:Connect(function(c)
         task.spawn(function()
             local toolType = autoKill and "weapon" or (autoWood and "axe" or "pickaxe")
 
-            -- 1) wait for character + tools to actually exist
+            -- wait for tools to load
             local t0 = os.clock()
             while os.clock() - t0 < 5 do
                 if char:FindFirstChildOfClass("Tool") or player.Backpack:FindFirstChildOfClass("Tool") then break end
                 task.wait(0.2)
             end
 
-            -- 2) equip weapon (robust, polls until in hand)
+            -- re-equip (polls until in hand)
             local te = os.clock()
             repeat
                 ensureEquipped(toolType)
                 task.wait(0.15)
             until char:FindFirstChildOfClass("Tool") or os.clock() - te > 4
 
-            -- 3) TP back to where we died
+            -- TP back to where we died
             local back = lastFarmPos
             pcall(function()
                 hrp.CFrame = CFrame.new(back)
                 hrp.AssemblyLinearVelocity = Vector3.zero
             end)
 
-            -- 4) wait for the area to stream in (until a target loads, 12s cap)
+            -- wait for the area to stream in (until a target loads, 12s cap)
             local ts = os.clock()
             while os.clock() - ts < 12 do
                 if anyTargetLoaded() then break end
                 pcall(function() hrp.CFrame = CFrame.new(back) end)
                 task.wait(0.5)
             end
-            -- farm loop resumes on its own
         end)
     end
 end)
-hookCooldowns(char)
 setupDeathWatch(hum)
 
--- ── Main farm loop (pcall-wrapped, throttled idle) ─────────
+-- ── Main farm loop ─────────────────────────────────────────
 task.spawn(function()
     while true do
         local ok = pcall(function()
-            -- Not farming → make sure we're unanchored, idle slowly
-            if not farmingActive() then
-                setAnchor(false)
-                task.wait(0.2)
-                return
-            end
+            if not farmingActive() then task.wait(0.2); return end
             if needRecover then task.wait(0.2); return end
 
             local isMob = autoKill
@@ -378,22 +321,9 @@ task.spawn(function()
             else targets = getResourceTargets(selOres) end
 
             local target = getClosest(targets)
-            if not target then
-                -- nothing loaded right now: ease off so we don't hammer the CPU
-                setAnchor(false)
-                task.wait(0.25)
-                return
-            end
+            if not target then task.wait(0.25); return end
 
             local obj, part = target.obj, target.part
-
-            -- cache AttackRange once per target (not per swing)
-            local range = atkBehind
-            if isMob and smartAvoid then
-                local ar = getAttackRange(obj)
-                if ar then range = ar + avoidBuffer end
-            end
-
             local tool = ensureEquipped(toolType)
 
             local guard, maxGuard = 0, (isMob and 220 or 420)
@@ -404,10 +334,9 @@ task.spawn(function()
                 if isMob then
                     local eHum = target.hum or obj:FindFirstChildOfClass("Humanoid")
                     if not eHum or eHum.Health <= 0 then break end
-                    tryAntiAggro(obj)
                 end
 
-                holdPosition(isMob and desiredMobCFrame(part, range) or desiredResCFrame(part))
+                holdPosition(desiredCFrame(part, isMob))
                 lastFarmPos = hrp.Position
 
                 if not (tool and tool.Parent == char) then
@@ -415,14 +344,11 @@ task.spawn(function()
                 end
                 swing(tool)
 
-                task.wait(swingDelay)
+                task.wait(SWING_DELAY)
                 guard += 1
             end
         end)
-        if not ok then
-            setAnchor(false)   -- never leave the player stuck anchored on error
-            task.wait(0.15)
-        end
+        if not ok then task.wait(0.15) end
     end
 end)
 
@@ -539,9 +465,9 @@ end)
 -- ══════════════════════════════════════════════════════════
 local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
 local Window = Rayfield:CreateWindow({
-    Name = "Autofarm v5",
+    Name = "Autofarm v6",
     LoadingTitle = "Loading...",
-    LoadingSubtitle = "Stable | Robust Equip | Less Lag",
+    LoadingSubtitle = "Lean combat",
     ConfigurationSaving = { Enabled = false },
     KeySystem = false
 })
@@ -554,11 +480,10 @@ local TabWood   = Window:CreateTab("Auto Wood")
 local TabExtras = Window:CreateTab("Extras")
 local TabESP    = Window:CreateTab("Mob ESP")
 
-TabInfo:CreateParagraph({ Title = "v5 — What Changed", Content =
-    "• Less lag: idle scans throttled, AttackRange cached, loop error-guarded\n" ..
-    "• Equip fixed: tries remote + EquipTool, retries, waits for tools on respawn\n" ..
-    "• Stable Mode: anchors you while farming so no more bobbing/twitch\n" ..
-    "• Toggle Stable Mode off in Combat if hits stop registering"
+TabInfo:CreateParagraph({ Title = "v6 — Lean", Content =
+    "Combat trimmed to: Death Recovery, No Cooldown, and Auto Kill targets.\n" ..
+    "Equip is auto-detected by tool type and fired through your EquipItem remote.\n" ..
+    "No Cooldown now actively zeroes Cooldown/Debounce values while it's on."
 })
 
 -- Auto Ore
@@ -586,35 +511,14 @@ for _, v in ipairs(bossTPList) do
     end})
 end
 
--- Combat
-TabCombat:CreateParagraph({ Title = "No-Damage = Avoid + Recover", Content =
-    "Health is server-authoritative (no damage remote), so you can't block damage. " ..
-    "Smart-Avoid keeps you outside each enemy's AttackRange; Stable Mode holds you still; " ..
-    "Death Recovery puts you back if something kills you."
-})
-TabCombat:CreateSection("Avoidance & Stability")
-TabCombat:CreateToggle({ Name="Stable Mode (anchor while farming)", CurrentValue=stableMode, Flag="Stable",
-    Callback=function(v) stableMode=v; if not v then setAnchor(false) end end })
-TabCombat:CreateToggle({ Name="Smart-Avoid (use AttackRange)", CurrentValue=smartAvoid, Flag="Smart",
-    Callback=function(v) smartAvoid=v end })
-TabCombat:CreateSlider({ Name="Avoid Buffer (studs past range)", Range={-4,15}, Increment=1, CurrentValue=avoidBuffer, Flag="Buf",
-    Callback=function(v) avoidBuffer=v end })
-TabCombat:CreateSlider({ Name="Attack Height (up)", Range={0,25}, Increment=1, CurrentValue=atkHeight, Flag="AtkH",
-    Callback=function(v) atkHeight=v end })
-TabCombat:CreateSlider({ Name="Fallback Distance (behind)", Range={2,15}, Increment=1, CurrentValue=atkBehind, Flag="AtkB",
-    Callback=function(v) atkBehind=v end })
-TabCombat:CreateSlider({ Name="Swing Delay (sec)", Range={0.02,0.2}, Increment=0.01, CurrentValue=swingDelay, Flag="SwD",
-    Callback=function(v) swingDelay = math.max(v, 0.02) end })
-
+-- Combat (lean)
 TabCombat:CreateSection("Survival")
 TabCombat:CreateToggle({ Name="Death Recovery (re-equip + TP back)", CurrentValue=deathRecover, Flag="Recover",
     Callback=function(v) deathRecover=v end })
-TabCombat:CreateToggle({ Name="Anti-Aggro (experimental)", CurrentValue=antiAggro, Flag="AntiAggro",
-    Callback=function(v) antiAggro=v end })
 
 TabCombat:CreateSection("Modifiers")
 TabCombat:CreateToggle({ Name="No Cooldown", CurrentValue=false, Flag="NoCooldown",
-    Callback=function(v) noCooldown=v; hookCooldowns(char) end })
+    Callback=function(v) noCooldown=v end })
 
 TabCombat:CreateSection("Auto Kill Targets")
 local allEnemyList = {}

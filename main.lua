@@ -1,12 +1,15 @@
 -- ============================================================
---  Autofarm Script v7 — Equip + Teleport Rebuild
+--  Autofarm Script v8 — Performance Fix Edition
 -- ============================================================
--- EQUIP: items here are Character children (Model/Tool with a Handle),
---   NOT Backpack Tools. We grab whatever is actually held, remember its
---   name per activity, and re-equip that name via your EquipItem remote.
--- TELEPORT: fixed WORLD-space offset from the target's position (no more
---   orbiting from enemy rotation); only re-teleports when the target moves.
--- Combat kept lean: Death Recovery, No Cooldown, Auto Kill list.
+-- KEY FIX: target scanning no longer walks the entire map.
+--   v7 called workspace.Areas:GetDescendants() (every brick/tree/building
+--   across all areas) which caused periodic CPU freezes -> you stood still
+--   and got hit. v8 scans only each area's Enemies / EnemiesToSpawnHere
+--   folders (a few dozen objects). Same fix applied to ESP.
+-- Also: tighter teleport offset (closer to enemy) and a stall-breaker so a
+--   locked mob that isn't taking damage gets dropped instead of standing.
+-- Carried over: held-item equip + per-mode re-equip, world-space teleport,
+--   death recovery, No Cooldown, lean combat UI.
 -- ============================================================
 
 local Players = game:GetService("Players")
@@ -29,14 +32,15 @@ local noCooldown, infiniteJump, espEnabled = false, false, false
 local deathRecover = true
 
 local SWING_DELAY = 0.05
-local MOB_OFFSET = Vector3.new(0, 2, 3)     -- world-space, near the mob
-local RES_OFFSET = Vector3.new(0, 2.5, 3)   -- world-space, near the resource
-local TARGET_MOVE_RETP = 3                    -- re-TP if target moved this far
-local FELL_AWAY_RETP   = 7                    -- re-TP if we ended up this far
+local MOB_OFFSET = Vector3.new(0, 1.5, 2)   -- closer to the mob (~2.5 studs)
+local RES_OFFSET = Vector3.new(0, 2, 2.5)
+local TARGET_MOVE_RETP = 3
+local FELL_AWAY_RETP   = 7
+local STALL_SECONDS    = 4                    -- drop a mob if no dmg landed this long
 
 local lastFarmPos = nil
 local needRecover = false
-local lastEquipped = {}   -- [mode] = item name we had equipped
+local lastEquipped = {}
 
 local selOres, selWood, selEnemies = {}, {}, {}
 local espCache = {}
@@ -100,18 +104,6 @@ local function getRootPart(obj)
     return nil
 end
 
-local function isEnemy(model)
-    local p = model.Parent
-    while p and p ~= workspace do
-        if p.Name == "Enemies" or p.Name == "SpawnRegions" or p.Name == "EnemiesToSpawnHere" then
-            return true
-        end
-        p = p.Parent
-    end
-    return false
-end
-
--- Standard character parts to ignore when hunting for the held item
 local CHAR_PART = {
     Humanoid=true, HumanoidRootPart=true, Head=true, Torso=true, UpperTorso=true, LowerTorso=true,
     ["Left Arm"]=true, ["Right Arm"]=true, ["Left Leg"]=true, ["Right Leg"]=true,
@@ -133,7 +125,6 @@ local function isHeldItem(c)
     return false
 end
 
--- The item currently held on the character (Tool OR Model w/ Handle)
 local function getEquipped()
     local fallback
     for _, c in ipairs(char:GetChildren()) do
@@ -152,7 +143,6 @@ local function currentMode()
     return nil
 end
 
--- Ensure something is equipped for this mode; remembers/restores by name
 local function ensureEquipped(mode)
     local eq = getEquipped()
     if eq then
@@ -174,7 +164,7 @@ local function ensureEquipped(mode)
     return getEquipped()
 end
 
--- ── No Cooldown (active zeroing) ───────────────────────────
+-- ── No Cooldown ────────────────────────────────────────────
 task.spawn(function()
     while task.wait(0.1) do
         if noCooldown and char then
@@ -187,16 +177,34 @@ task.spawn(function()
     end
 end)
 
--- ── Target scanners ────────────────────────────────────────
+-- ── Enemy folder collection (PERF: avoids whole-map scan) ──
+local function collectEnemyFolders()
+    local folders = {}
+    local areas = workspace:FindFirstChild("Areas")
+    if not areas then return folders end
+    for _, area in ipairs(areas:GetChildren()) do
+        local en = area:FindFirstChild("Enemies")
+        if en then folders[#folders+1] = en end
+        local sr = area:FindFirstChild("SpawnRegions")
+        if sr then
+            local sub = sr:FindFirstChild("Area")
+            local eth = sub and sub:FindFirstChild("EnemiesToSpawnHere")
+            if eth then folders[#folders+1] = eth end
+        end
+    end
+    return folders
+end
+
 local function getMobTargets()
     local list = {}
-    local root = workspace:FindFirstChild("Areas") or workspace
-    for _, obj in ipairs(root:GetDescendants()) do
-        if obj:IsA("Model") and selEnemies[obj.Name] and isEnemy(obj) then
-            local eHum = obj:FindFirstChildOfClass("Humanoid")
-            local part = getRootPart(obj)
-            if eHum and eHum.Health > 0 and part then
-                table.insert(list, {obj=obj, part=part, hum=eHum})
+    for _, folder in ipairs(collectEnemyFolders()) do
+        for _, obj in ipairs(folder:GetChildren()) do
+            if obj:IsA("Model") and selEnemies[obj.Name] then
+                local eHum = obj:FindFirstChildOfClass("Humanoid")
+                local part = getRootPart(obj)
+                if eHum and eHum.Health > 0 and part then
+                    list[#list+1] = {obj=obj, part=part, hum=eHum}
+                end
             end
         end
     end
@@ -214,7 +222,7 @@ local function getResourceTargets(selTable)
                 for _, res in ipairs(cr:GetChildren()) do
                     if selTable[res.Name] then
                         local part = getRootPart(res)
-                        if part then table.insert(list, {obj=res, part=part}) end
+                        if part then list[#list+1] = {obj=res, part=part} end
                     end
                 end
             end
@@ -263,24 +271,16 @@ player.CharacterAdded:Connect(function(c)
         task.spawn(function()
             local mode = currentMode()
             local back = lastFarmPos
-
-            -- 1) wait for the character to settle
             task.wait(1)
-
-            -- 2) re-equip the remembered item (poll until it's in hand)
             local te = os.clock()
             repeat
                 ensureEquipped(mode)
                 task.wait(0.2)
             until getEquipped() or os.clock() - te > 5
-
-            -- 3) TP back to where we died
             pcall(function()
                 hrp.CFrame = CFrame.new(back)
                 hrp.AssemblyLinearVelocity = Vector3.zero
             end)
-
-            -- 4) wait for the area to stream in (until a target loads, 12s)
             local ts = os.clock()
             while os.clock() - ts < 12 do
                 if anyTargetLoaded() then break end
@@ -315,17 +315,26 @@ task.spawn(function()
             local anchorPos = nil
             local guard, maxGuard = 0, (isMob and 220 or 420)
 
+            -- stall tracking (drop a mob that isn't taking damage)
+            local lastHP, stallT = nil, os.clock()
+
             ensureEquipped(mode)
 
             while obj.Parent and part.Parent and guard < maxGuard do
                 if not farmingActive() then break end
                 if needRecover then break end
+
                 if isMob then
                     local eHum = target.hum or obj:FindFirstChildOfClass("Humanoid")
                     if not eHum or eHum.Health <= 0 then break end
+                    -- stall-breaker
+                    local h = eHum.Health
+                    if lastHP == nil then lastHP = h end
+                    if h < lastHP then lastHP = h; stallT = os.clock() end
+                    if os.clock() - stallT > STALL_SECONDS then break end
                 end
 
-                -- WORLD-space teleport (no orbiting); only when target moves
+                -- WORLD-space teleport, only when target moves / we fall away
                 local desired = part.Position + offset
                 if (not anchorPos)
                    or (anchorPos - desired).Magnitude > TARGET_MOVE_RETP
@@ -336,7 +345,6 @@ task.spawn(function()
                 end
                 lastFarmPos = hrp.Position
 
-                -- equip (by held item / remembered name) + swing
                 local eq = getEquipped() or ensureEquipped(mode)
                 if eq then
                     if mode then lastEquipped[mode] = eq.Name end
@@ -352,7 +360,7 @@ task.spawn(function()
 end)
 
 -- ═══════════════════════════════════════════════════════════
---  ESP
+--  ESP (also uses the cheap enemy-folder scan)
 -- ═══════════════════════════════════════════════════════════
 local function destroyESP(model)
     local d = espCache[model]
@@ -430,12 +438,13 @@ task.spawn(function()
             end
             continue
         end
-        local root = workspace:FindFirstChild("Areas") or workspace
         local seen = {}
-        for _, m in ipairs(root:GetDescendants()) do
-            if m:IsA("Model") and allMobSet[m.Name] and isEnemy(m) then
-                local eHum = m:FindFirstChildOfClass("Humanoid")
-                if eHum and eHum.Health > 0 then seen[m] = true; buildESP(m) end
+        for _, folder in ipairs(collectEnemyFolders()) do
+            for _, m in ipairs(folder:GetChildren()) do
+                if m:IsA("Model") and allMobSet[m.Name] then
+                    local eHum = m:FindFirstChildOfClass("Humanoid")
+                    if eHum and eHum.Health > 0 then seen[m] = true; buildESP(m) end
+                end
             end
         end
         for m in pairs(espCache) do if not seen[m] then destroyESP(m) end end
@@ -464,9 +473,9 @@ end)
 -- ══════════════════════════════════════════════════════════
 local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
 local Window = Rayfield:CreateWindow({
-    Name = "Autofarm v7",
+    Name = "Autofarm v8",
     LoadingTitle = "Loading...",
-    LoadingSubtitle = "Equip + Teleport rebuilt",
+    LoadingSubtitle = "Performance fix",
     ConfigurationSaving = { Enabled = false },
     KeySystem = false
 })
@@ -479,12 +488,10 @@ local TabWood   = Window:CreateTab("Auto Wood")
 local TabExtras = Window:CreateTab("Extras")
 local TabESP    = Window:CreateTab("Mob ESP")
 
-TabInfo:CreateParagraph({ Title = "v7", Content =
-    "Equip now grabs the item actually held on your character (Model/Tool with\n" ..
-    "a Handle) and re-equips it by name via your EquipItem remote. Teleport uses\n" ..
-    "a fixed world offset from the target so it no longer orbits rotating enemies.\n" ..
-    "TIP: have the correct tool equipped when you start each mode the first time;\n" ..
-    "it's remembered per mode and auto re-equipped after death."
+TabInfo:CreateParagraph({ Title = "v8 — Performance", Content =
+    "Lag spikes fixed: target scan now reads only the Enemies folders, not\n" ..
+    "the entire map. Teleport sits closer to the enemy. A stall-breaker drops\n" ..
+    "any mob that isn't taking damage so the character won't just stand there."
 })
 
 -- Auto Ore

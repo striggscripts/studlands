@@ -1,14 +1,16 @@
 -- ============================================================
---  Autofarm Script v9 — Full Roster Edition (Studlands)
+--  Autofarm Script v11 — Self-Calibrating Boss Cooldowns
 -- ============================================================
--- NEW IN v9:
---  • Enemy/ore lists expanded from the Studlands wiki, sorted alphabetically
---  • Bosses split into their own section (also alphabetical)
---  • "Kill ALL / Mine ALL / Chop ALL" master toggles — match by folder
---    membership so nothing is missed even if a name differs slightly
---  • Ore toggles register name variants (bare / " Ore" / " Vein")
--- Carried over: cheap enemy-folder scan (no map-wide lag), held-item equip
---  with per-mode re-equip, world-space teleport, death recovery, No Cooldown.
+-- NEW IN v10:
+--  • FULL enemy list pulled from ReplicatedStorage.Enemies (exact in-game
+--    names), alphabetical, bosses split into their own section.
+--  • Boss Timers tab: auto-detects when a boss is alive / gone and counts
+--    down a 15-min respawn (confirmed for Duke & Blazing Jimbee). Includes
+--    "Mark killed" buttons for when you're out of the boss's area, plus an
+--    adjustable respawn interval.
+--  Carried over: master Kill/Mine/Chop ALL toggles, cheap enemy-folder scan,
+--  held-item equip + per-mode re-equip, world teleport, death recovery,
+--  No Cooldown.
 -- ============================================================
 
 local Players = game:GetService("Players")
@@ -45,34 +47,58 @@ local lastEquipped = {}
 local selOres, selWood, selEnemies = {}, {}, {}
 local espCache = {}
 
--- ── Content lists (alphabetical) ───────────────────────────
+-- ── Content lists (exact names from ReplicatedStorage.Enemies) ──
 local oreNames = {
     "Amethyst","Blood Stone","Copper","Dark Geode","Darktainium","Diamond",
     "Emerald","Gold","Ice","Iron","Jade","Magnetite","Meteorite","Obsidian",
     "Platinum","Rock","Salt Rock","Sandstone","Sapphire","Shroomium","Tin","Valerion"
 }
-
 local woodNames = { "Oak Stump","Redwood Stump","Spruce Stump" }
 
 local regularEnemies = {
-    "Angry Wasp","Ballzo","Ballzo Warrior","Bell Flowey","Blooming Flowey","Bonezo",
-    "Browncapey","Buney","Cave Spidey","Cavey","Coconut Crab","Crab Champion","Cubey",
-    "Cubey Mage","Cublin","Cublin Brute","Cublin Warrior","Cylindery","Darktainium Miner",
-    "Dummy","El Espinoso","Field Mousey","Fire Flowey","Firefly","Floral Turtley","Flowey",
-    "Flying Goldfish","Frogey","Frost Buney","Ghostey","Ice Lizardey","Icy Snail","Lilypadey",
-    "Living Berry Bush","Mini Bomb","Mini Cubey","Moai","Mousey","Mushey","Mystic Mimic",
-    "Parawalker","Pestililypadey","Prickley","Pumpkiney","Pumpkinpadey","Redwood Mimic",
-    "Rustey","Scorpion","Sentient Assault Rifle","Snowdeerey","Solar Elemental","Spidey",
-    "Spikezo","Stoney","Swamp Hydrey","Target Dummy","Tumblezo","Vampiric Druid",
-    "Vampiric Outlaw","Viney","Watchstalker","Wedgey","Wooden Mimic","Wraithhorn Scorpion"
+    "Angry Wasp","Bad Lad","Ballzo","Ballzo Warrior","Bananey","Bell Flowey","Big Mushman",
+    "Bloom Mimic","Blooming Flowey","Blossom Keeper","Blueberrey","Bluecapey","Bombee","Bombey",
+    "Bonezo","Browncapey","Bumblecubee","Buney","Candy Corn Leafy","Cave Spidey","Cavey",
+    "Coconut Crab","Coghead","Corney","Crab Champion","Cubee","Cubeek","Cubemaster","Cubey",
+    "Cubey Bandit","Cubey Bodyguard","Cubey Mage","Cublin","Cublin Brute","Cublin Warrior",
+    "Cylindery","Easter Buney","Eclipsed Ghostey","El Espinoso","Field Mousey","Fire Flowey",
+    "Firefly","Floral Turtley","Flowey","Flying Archerfish","Flying Goldfish","Fremlin","Frogey",
+    "Frost Buney","Ghostey","Gnome","Hallow Cubey Mage","Honey Mimic","Ice Lizardey","Icy Snail",
+    "Jack O'Cubee","Leafy","Lepus","Lilypadey","Living Berry Bush","Midnight Samurai","Mini Cubey",
+    "Mini Leafy","Mini Tankzo","Moai","Monster Mousey","Mousey","Mr. CRT","Mushey","Mushmasher",
+    "Mystic Mimic","Parawalker","Pestililypadey","Petalith","Prickley","Pumpkiney","Pumpkinpadey",
+    "Quadropod","Redwood Mimic","Roadkillzo","Rogue Cubey","Rustey","Scorpion","Sea Serpent",
+    "Sentient Assault Rifle","Shockbox","Snowdeerey","Solar Elemental","Spidey","Spikezo","Stoney",
+    "Strawberry","Swamp Hydrey","Target Dummy","Testing Cubey","Tumblezo","Vampiric Druid",
+    "Vampiric Outlaw","Voidey","Watchstalker","Wedgey","Wedgey1","Wooden Mimic","Wraithhorn"
 }
 
 local bossEnemies = {
-    "Blazing Jimbee","Duke Cublindor","Enormous Ballzo","Glacier Giant","Jimbee",
-    "Lord Cublindor","Musheynator","Orbdenier","Pharaoh's Curse"
+    "Awakened Swamp Hydrey","BLAZING JIMBEE","C U B E Y","CURSE INCARNATE","Duke Cublindor",
+    "Enormous Ballzo","Eruption Furnace","Glacier Giant","Jimbee","LORD CUBLINDOR",
+    "Lord Ganongar The 12th","Musheynator","Orbdenier","Pharaoh's Curse","Wedgey God"
 }
 
 local bossSet = {}; for _, b in ipairs(bossEnemies) do bossSet[b] = true end
+
+-- Bosses tracked for summon-cooldown timers (the main world/dungeon bosses).
+-- 15 min is the wiki-sourced cooldown (Duke, Enormous Ballzo, Lord Cublindor,
+-- Blazing Jimbee). These bosses are SUMMONED, not auto-respawning, so this is a
+-- cooldown-until-can-be-summoned-again, and it SELF-CALIBRATES from observation.
+local TIMER_BOSSES = {
+    "Duke Cublindor","Jimbee","Pharaoh's Curse","Musheynator",
+    "Enormous Ballzo","Glacier Giant","Orbdenier"
+}
+local DEFAULT_CD = 900   -- 15 minutes (sourced); used until a real interval is measured
+local bossState = {}
+-- seen     = currently present & alive in a loaded area
+-- lastDeath= os.time() when it last went from present -> absent
+-- nextReady= os.time() the cooldown finishes
+-- interval = cooldown length (starts at DEFAULT_CD, updated by measurement)
+-- measured = true once we've timed a real death->reappear cycle
+for _, b in ipairs(TIMER_BOSSES) do
+    bossState[b] = { seen=false, lastDeath=nil, nextReady=nil, interval=DEFAULT_CD, measured=false }
+end
 
 local tpList = {
     {"Home",     Vector3.new(-591,-351,-195)},
@@ -181,7 +207,7 @@ task.spawn(function()
     end
 end)
 
--- ── Enemy folders (cheap; never the whole map) ─────────────
+-- ── Enemy folders ──────────────────────────────────────────
 local function collectEnemyFolders()
     local folders = {}
     local areas = workspace:FindFirstChild("Areas")
@@ -218,7 +244,6 @@ local function getMobTargets()
     return list
 end
 
--- kind = "ore" or "wood"
 local function getResourceTargets(kind)
     local list = {}
     local spawns = workspace:FindFirstChild("ResourceSpawns")
@@ -257,12 +282,52 @@ local function getClosest(list)
     return best
 end
 
--- ── Active-flag recompute ──────────────────────────────────
 local function recompute()
     autoKill = killAll or (next(selEnemies) ~= nil)
     autoOre  = mineAll or (next(selOres) ~= nil)
     autoWood = chopAll or (next(selWood) ~= nil)
 end
+
+-- ── Boss timer monitor ─────────────────────────────────────
+local function bossPresent(name)
+    for _, folder in ipairs(collectEnemyFolders()) do
+        local m = folder:FindFirstChild(name)
+        if m then
+            local h = m:FindFirstChildOfClass("Humanoid")
+            if h and h.Health > 0 then return true end
+        end
+    end
+    return false
+end
+
+task.spawn(function()
+    while task.wait(2) do
+        for _, name in ipairs(TIMER_BOSSES) do
+            local st = bossState[name]
+            local present = bossPresent(name)
+            if present then
+                if not st.seen then
+                    -- boss just (re)appeared — if we timed its absence, learn the interval
+                    if st.lastDeath then
+                        local measured = os.time() - st.lastDeath
+                        -- accept only sane values (30s .. 2h) to ignore glitches
+                        if measured >= 30 and measured <= 7200 then
+                            st.interval = measured
+                            st.measured = true
+                        end
+                    end
+                    st.nextReady = nil
+                end
+                st.seen = true
+            elseif st.seen then
+                -- boss just died / despawned — start the cooldown
+                st.seen = false
+                st.lastDeath = os.time()
+                st.nextReady = os.time() + st.interval
+            end
+        end
+    end
+end)
 
 -- ── Death recovery ─────────────────────────────────────────
 local function farmingActive() return autoKill or autoOre or autoWood end
@@ -378,7 +443,7 @@ task.spawn(function()
 end)
 
 -- ═══════════════════════════════════════════════════════════
---  ESP (highlights ALL enemies in enemy folders)
+--  ESP
 -- ═══════════════════════════════════════════════════════════
 local function destroyESP(model)
     local d = espCache[model]
@@ -491,9 +556,9 @@ end)
 -- ══════════════════════════════════════════════════════════
 local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
 local Window = Rayfield:CreateWindow({
-    Name = "Autofarm v9",
+    Name = "Autofarm v11",
     LoadingTitle = "Loading...",
-    LoadingSubtitle = "Full roster + master toggles",
+    LoadingSubtitle = "Self-calibrating boss cooldowns",
     ConfigurationSaving = { Enabled = false },
     KeySystem = false
 })
@@ -503,24 +568,20 @@ local TabOre    = Window:CreateTab("Auto Ore")
 local TabTPs    = Window:CreateTab("Teleports")
 local TabCombat = Window:CreateTab("Combat")
 local TabWood   = Window:CreateTab("Auto Wood")
+local TabTimers = Window:CreateTab("Boss Timers")
 local TabExtras = Window:CreateTab("Extras")
 local TabESP    = Window:CreateTab("Mob ESP")
 
-TabInfo:CreateParagraph({ Title = "v9 — Full Roster", Content =
-    "Enemy & ore lists expanded from the Studlands wiki, alphabetical, bosses\n" ..
-    "in their own section. Master toggles (Kill/Mine/Chop ALL) match by folder\n" ..
-    "so nothing is missed even if a name differs. Kill mode takes priority if\n" ..
-    "multiple modes are on."
+TabInfo:CreateParagraph({ Title = "v10 — Complete Roster", Content =
+    "Full enemy list pulled straight from the game's Enemies folder (exact\n" ..
+    "names), alphabetical, bosses separated. Master toggles still catch anything.\n" ..
+    "Boss Timers tab tracks 15-min respawns (auto when in-area, or Mark killed)."
 })
 
 -- ── Auto Ore ───────────────────────────────────────────────
 TabOre:CreateSection("Master")
 TabOre:CreateToggle({ Name="Mine ALL Ores", CurrentValue=false, Flag="MineAll",
-    Callback=function(v)
-        mineAll = v
-        if v then chopAll=false; killAll=false end
-        recompute()
-    end })
+    Callback=function(v) mineAll=v; if v then chopAll=false; killAll=false end; recompute() end })
 TabOre:CreateSection("Select Ore")
 for _, ore in ipairs(oreNames) do
     TabOre:CreateToggle({ Name = "Mine "..ore, CurrentValue = false, Flag = "Ore_"..ore,
@@ -553,11 +614,7 @@ TabCombat:CreateToggle({ Name="No Cooldown", CurrentValue=false, Flag="NoCooldow
 
 TabCombat:CreateSection("Master")
 TabCombat:CreateToggle({ Name="Kill ALL Enemies", CurrentValue=false, Flag="KillAll",
-    Callback=function(v)
-        killAll = v
-        if v then mineAll=false; chopAll=false end
-        recompute()
-    end })
+    Callback=function(v) killAll=v; if v then mineAll=false; chopAll=false end; recompute() end })
 
 TabCombat:CreateSection("Bosses")
 for _, name in ipairs(bossEnemies) do
@@ -574,11 +631,7 @@ end
 -- ── Auto Wood ──────────────────────────────────────────────
 TabWood:CreateSection("Master")
 TabWood:CreateToggle({ Name="Chop ALL Wood", CurrentValue=false, Flag="ChopAll",
-    Callback=function(v)
-        chopAll = v
-        if v then mineAll=false; killAll=false end
-        recompute()
-    end })
+    Callback=function(v) chopAll=v; if v then mineAll=false; killAll=false end; recompute() end })
 TabWood:CreateSection("Select Wood")
 for _, w in ipairs(woodNames) do
     TabWood:CreateToggle({ Name=w, CurrentValue=false, Flag="Wood_"..w,
@@ -588,6 +641,63 @@ for _, w in ipairs(woodNames) do
             recompute()
         end })
 end
+
+-- ── Boss Timers ────────────────────────────────────────────
+TabTimers:CreateParagraph({ Title="How it works", Content=
+    "These bosses are SUMMONED (item / dungeon / enrage) on a cooldown, not auto-\n" ..
+    "respawning. Default cooldown is 15 min (wiki: Duke, Enormous Ballzo, Lord\n" ..
+    "Cublindor, Blazing Jimbee). While you're in a boss's area the script measures\n" ..
+    "the real death->reappear time and CALIBRATES that boss automatically (shows\n" ..
+    "'measured'). Out of area, hit 'Mark killed' to start the cooldown manually." })
+TabTimers:CreateSlider({ Name="Default cooldown (min)", Range={1,60}, Increment=1, CurrentValue=15, Flag="BossInt",
+    Callback=function(v)
+        -- set the default for any boss not yet calibrated from observation
+        for _, name in ipairs(TIMER_BOSSES) do
+            local st = bossState[name]
+            if not st.measured then st.interval = v*60 end
+        end
+    end })
+
+TabTimers:CreateSection("Status")
+local bossLabels = {}
+for _, name in ipairs(TIMER_BOSSES) do
+    bossLabels[name] = TabTimers:CreateLabel(name .. ": --")
+end
+
+TabTimers:CreateSection("Mark Killed (manual)")
+for _, name in ipairs(TIMER_BOSSES) do
+    TabTimers:CreateButton({ Name="Mark "..name.." killed", Callback=function()
+        local st = bossState[name]
+        st.seen = false
+        st.lastDeath = os.time()
+        st.nextReady = os.time() + st.interval
+    end})
+end
+
+-- live updater for boss timer labels
+task.spawn(function()
+    while task.wait(1) do
+        for _, name in ipairs(TIMER_BOSSES) do
+            local st = bossState[name]
+            local tag = st.measured and "measured" or "default"
+            local cdm = math.floor(st.interval/60)
+            local txt
+            if st.seen then
+                txt = string.format("%s: ALIVE NOW  (cd ~%dm, %s)", name, cdm, tag)
+            elseif st.nextReady then
+                local rem = st.nextReady - os.time()
+                if rem <= 0 then
+                    txt = string.format("%s: READY  (cd ~%dm, %s)", name, cdm, tag)
+                else
+                    txt = string.format("%s: %d:%02d  (cd ~%dm, %s)", name, math.floor(rem/60), rem%60, cdm, tag)
+                end
+            else
+                txt = string.format("%s: -- no data yet  (cd ~%dm, %s)", name, cdm, tag)
+            end
+            pcall(function() bossLabels[name]:Set(txt) end)
+        end
+    end
+end)
 
 -- ── Extras ─────────────────────────────────────────────────
 TabExtras:CreateSection("Character")

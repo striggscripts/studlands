@@ -1,5 +1,5 @@
 -- ============================================================
---  Autofarm Script v11 — Self-Calibrating Boss Cooldowns
+--  Autofarm Script v14 — Full Quest Automation
 -- ============================================================
 -- NEW IN v10:
 --  • FULL enemy list pulled from ReplicatedStorage.Enemies (exact in-game
@@ -26,9 +26,34 @@ local hum    = char:WaitForChild("Humanoid")
 local ClientRemotes = RS:WaitForChild("ClientRemotes")
 local UseItem   = ClientRemotes:WaitForChild("Character"):WaitForChild("UseItem")
 local EquipItem = ClientRemotes:WaitForChild("Inventory"):WaitForChild("EquipItem")
+-- NPC dialog remote (captured): DialogEvent:FireServer(npc, "StartQuest", {QuestName=...})
+local DialogEvent = ClientRemotes:WaitForChild("Character"):WaitForChild("DialogEvent", 10)
+
+-- Find any remote by name anywhere under ClientRemotes (e.g. "StartDungeon")
+local function findRemote(name)
+    for _, d in ipairs(ClientRemotes:GetDescendants()) do
+        if d.Name == name and (d:IsA("RemoteEvent") or d:IsA("RemoteFunction")) then
+            return d
+        end
+    end
+    return nil
+end
+
+local function callRemote(r, ...)
+    if not r then return false, "remote not found" end
+    if r:IsA("RemoteFunction") then
+        return pcall(function(...) return r:InvokeServer(...) end, ...)
+    end
+    return pcall(function(...) r:FireServer(...) end, ...)
+end
 
 -- ── State ──────────────────────────────────────────────────
 local autoOre, autoWood, autoKill = false, false, false
+local autoDungeon = false        -- Auto Dungeon mode (overrides other farming)
+local autoQuest   = false        -- Auto-farm active quest kill targets
+local autoTurnIn  = false        -- Auto turn-in completed quests (known NPCs)
+local questActionMsg = ""        -- last accept/turn-in result for the UI
+local dungeonChoice = "CublinDungeon"  -- which dungeon to run
 local mineAll, chopAll, killAll   = false, false, false
 local noCooldown, infiniteJump, espEnabled = false, false, false
 local deathRecover = true
@@ -59,7 +84,7 @@ local regularEnemies = {
     "Angry Wasp","Bad Lad","Ballzo","Ballzo Warrior","Bananey","Bell Flowey","Big Mushman",
     "Bloom Mimic","Blooming Flowey","Blossom Keeper","Blueberrey","Bluecapey","Bombee","Bombey",
     "Bonezo","Browncapey","Bumblecubee","Buney","Candy Corn Leafy","Cave Spidey","Cavey",
-    "Coconut Crab","Coghead","Corney","Crab Champion","Cubee","Cubeek","Cubemaster","Cubey",
+    "Coconut Crab","Coghead","Corney","Cubee","Cubeek","Cubemaster","Cubey",
     "Cubey Bandit","Cubey Bodyguard","Cubey Mage","Cublin","Cublin Brute","Cublin Warrior",
     "Cylindery","Easter Buney","Eclipsed Ghostey","El Espinoso","Field Mousey","Fire Flowey",
     "Firefly","Floral Turtley","Flowey","Flying Archerfish","Flying Goldfish","Fremlin","Frogey",
@@ -74,30 +99,49 @@ local regularEnemies = {
 }
 
 local bossEnemies = {
-    "Awakened Swamp Hydrey","BLAZING JIMBEE","C U B E Y","CURSE INCARNATE","Duke Cublindor",
-    "Enormous Ballzo","Eruption Furnace","Glacier Giant","Jimbee","LORD CUBLINDOR",
-    "Lord Ganongar The 12th","Musheynator","Orbdenier","Pharaoh's Curse","Wedgey God"
+    "Awakened Swamp Hydrey","BLAZING JIMBEE","C U B E Y","CURSE INCARNATE","Crab Champion",
+    "Duke Cublindor","Enormous Ballzo","Eruption Furnace","Glacier Giant","Jimbee",
+    "LORD CUBLINDOR","Lord Ganongar The 12th","Musheynator","Orbdenier","Pharaoh's Curse","Wedgey God"
 }
 
 local bossSet = {}; for _, b in ipairs(bossEnemies) do bossSet[b] = true end
 
--- Bosses tracked for summon-cooldown timers (the main world/dungeon bosses).
--- 15 min is the wiki-sourced cooldown (Duke, Enormous Ballzo, Lord Cublindor,
--- Blazing Jimbee). These bosses are SUMMONED, not auto-respawning, so this is a
--- cooldown-until-can-be-summoned-again, and it SELF-CALIBRATES from observation.
-local TIMER_BOSSES = {
-    "Duke Cublindor","Jimbee","Pharaoh's Curse","Musheynator",
-    "Enormous Ballzo","Glacier Giant","Orbdenier"
+-- Boss trackers, split by ACTUAL mechanic (researched on the Studlands wiki):
+--  • RESPAWN_MINIBOSSES auto-respawn at a shrine on a timer. Cylindery spawns
+--    at the cylinder shrine every 64s (wiki-sourced), one at a time.
+--  • SUMMON_BOSSES only appear when summoned (item / dungeon / enrage), gated by
+--    a cooldown. 15 min is the wiki-sourced cooldown (Duke, Enormous Ballzo,
+--    Lord Cublindor, Blazing Jimbee, Crab Champion).
+-- Both share the same detect-and-count mechanic; only defaults/labels differ.
+local RESPAWN_MINIBOSSES = { "Cylindery" }
+local SUMMON_BOSSES = {
+    "Crab Champion","Duke Cublindor","Enormous Ballzo","Glacier Giant",
+    "Jimbee","Musheynator","Orbdenier","Pharaoh's Curse"
 }
-local DEFAULT_CD = 900   -- 15 minutes (sourced); used until a real interval is measured
+
+local DEFAULT_CD_SUMMON  = 900  -- 15 min, wiki-sourced summon cooldown
+local DEFAULT_CD_RESPAWN = 64   -- 64s, wiki-sourced Cylindery shrine respawn
+
+local TRACKED = {}        -- ordered: { {name=, kind=}, ... }
+local TRACKED_NAMES = {}  -- ordered plain names for loops
+for _, n in ipairs(RESPAWN_MINIBOSSES) do
+    TRACKED[#TRACKED+1] = { name=n, kind="respawn" }; TRACKED_NAMES[#TRACKED_NAMES+1] = n
+end
+for _, n in ipairs(SUMMON_BOSSES) do
+    TRACKED[#TRACKED+1] = { name=n, kind="summon" }; TRACKED_NAMES[#TRACKED_NAMES+1] = n
+end
+
 local bossState = {}
 -- seen     = currently present & alive in a loaded area
 -- lastDeath= os.time() when it last went from present -> absent
--- nextReady= os.time() the cooldown finishes
--- interval = cooldown length (starts at DEFAULT_CD, updated by measurement)
--- measured = true once we've timed a real death->reappear cycle
-for _, b in ipairs(TIMER_BOSSES) do
-    bossState[b] = { seen=false, lastDeath=nil, nextReady=nil, interval=DEFAULT_CD, measured=false }
+-- nextReady= os.time() the timer/cooldown finishes
+-- interval = length (starts at the kind's sourced default, updated by measurement)
+-- measured = true once we've timed a real gone->reappear cycle
+-- kind     = "respawn" | "summon"
+for _, t in ipairs(TRACKED) do
+    local cd = (t.kind == "respawn") and DEFAULT_CD_RESPAWN or DEFAULT_CD_SUMMON
+    bossState[t.name] = { seen=false, lastDeath=nil, nextReady=nil,
+                          interval=cd, measured=false, kind=t.kind }
 end
 
 local tpList = {
@@ -167,7 +211,8 @@ local function getEquipped()
 end
 
 local function currentMode()
-    if autoKill then return "kill"
+    if autoDungeon or autoQuest then return "kill"  -- both use the weapon memory
+    elseif autoKill then return "kill"
     elseif autoWood then return "wood"
     elseif autoOre then return "ore" end
     return nil
@@ -286,6 +331,8 @@ local function recompute()
     autoKill = killAll or (next(selEnemies) ~= nil)
     autoOre  = mineAll or (next(selOres) ~= nil)
     autoWood = chopAll or (next(selWood) ~= nil)
+    -- enabling any normal farm mode takes over from Auto Dungeon / Auto Quest
+    if autoKill or autoOre or autoWood then autoDungeon = false; autoQuest = false end
 end
 
 -- ── Boss timer monitor ─────────────────────────────────────
@@ -302,7 +349,7 @@ end
 
 task.spawn(function()
     while task.wait(2) do
-        for _, name in ipairs(TIMER_BOSSES) do
+        for _, name in ipairs(TRACKED_NAMES) do
             local st = bossState[name]
             local present = bossPresent(name)
             if present then
@@ -329,11 +376,387 @@ task.spawn(function()
     end
 end)
 
+-- ── Auto Dungeon ───────────────────────────────────────────
+-- Built from Dex captures of the live dungeon structure:
+--   Areas.<Dungeon>.DungeonKills.StageN (IntValue kills) + .Required (IntValue)
+--   Areas.<Dungeon>.Enemies            (live mobs spawn here, incl. the boss)
+--   Areas.<Dungeon>.SpawnRegions.Boss.EnemiesToSpawnHere -> boss name
+--   Areas.<Dungeon>.Spawn              (entry point model)
+--   BeeHive only: Map.Switches.Switch1-4 with a "Pulled" attribute
+local DUNGEONS = {
+    CublinDungeon = {
+        label = "Duke Cublindor's Domain",
+        boss  = "Duke Cublindor",       -- becomes LORD CUBLINDOR when enraged
+        altBoss = "LORD CUBLINDOR",
+        hasSwitches = false,
+    },
+    BeeHiveArea = {
+        label = "The Grand Beehive",
+        boss  = "Jimbee",               -- becomes BLAZING JIMBEE when enraged
+        altBoss = "BLAZING JIMBEE",
+        hasSwitches = true,
+    },
+}
+
+local dungeonStatus = "idle"
+local dungeonBossWasSeen = false
+
+local function getDungeonArea()
+    local areas = workspace:FindFirstChild("Areas")
+    return areas and areas:FindFirstChild(dungeonChoice) or nil
+end
+
+-- Live, alive models in the dungeon's Enemies folder (boss included)
+local function getDungeonTargets()
+    local list = {}
+    local area = getDungeonArea()
+    if not area then return list end
+    local en = area:FindFirstChild("Enemies")
+    if not en then return list end
+    for _, obj in ipairs(en:GetChildren()) do
+        if obj:IsA("Model") then
+            local eHum = obj:FindFirstChildOfClass("Humanoid")
+            local part = getRootPart(obj)
+            if eHum and eHum.Health > 0 and part then
+                list[#list+1] = {obj=obj, part=part, hum=eHum}
+            end
+        end
+    end
+    return list
+end
+
+-- "S1 12/20  S2 0/20  S3 0/25" from DungeonKills
+local function dungeonKillText()
+    local area = getDungeonArea()
+    if not area then return "?" end
+    local dk = area:FindFirstChild("DungeonKills")
+    if not dk then return "?" end
+    local parts = {}
+    for _, st in ipairs(dk:GetChildren()) do
+        if st:IsA("IntValue") then
+            local req = st:FindFirstChild("Required")
+            local r = (req and req:IsA("IntValue")) and req.Value or "?"
+            parts[#parts+1] = string.format("%s %d/%s", st.Name:gsub("Stage","S"), st.Value, tostring(r))
+        end
+    end
+    table.sort(parts)
+    return table.concat(parts, "  ")
+end
+
+local function dungeonStagesDone()
+    local area = getDungeonArea()
+    if not area then return false end
+    local dk = area:FindFirstChild("DungeonKills")
+    if not dk then return false end
+    local any = false
+    for _, st in ipairs(dk:GetChildren()) do
+        if st:IsA("IntValue") then
+            any = true
+            local req = st:FindFirstChild("Required")
+            if req and req:IsA("IntValue") and st.Value < req.Value then return false end
+        end
+    end
+    return any
+end
+
+local function dungeonBossAlive()
+    local def = DUNGEONS[dungeonChoice]
+    if not def then return nil end
+    local area = getDungeonArea()
+    local en = area and area:FindFirstChild("Enemies")
+    if not en then return nil end
+    for _, nm in ipairs({def.boss, def.altBoss}) do
+        local m = nm and en:FindFirstChild(nm)
+        if m then
+            local h = m:FindFirstChildOfClass("Humanoid")
+            if h and h.Health > 0 then return m end
+        end
+    end
+    return nil
+end
+
+-- Beehive switch phase: TP to each unpulled switch and fire its prompt
+local function pullSwitches()
+    local area = getDungeonArea()
+    local map = area and area:FindFirstChild("Map")
+    local sw  = map and map:FindFirstChild("Switches")
+    if not sw then return true end   -- nothing to pull
+    local allPulled = true
+    for _, s in ipairs(sw:GetChildren()) do
+        if s:IsA("Model") and s.Name:find("Switch") then
+            if s:GetAttribute("Pulled") ~= true then
+                allPulled = false
+                dungeonStatus = "pulling " .. s.Name
+                local pivot = s:GetPivot().Position
+                pcall(function()
+                    hrp.CFrame = CFrame.new(pivot + Vector3.new(0, 3, 0))
+                    hrp.AssemblyLinearVelocity = Vector3.zero
+                end)
+                task.wait(0.4)
+                -- fire any ProximityPrompt inside the switch (exploit global)
+                for _, d in ipairs(s:GetDescendants()) do
+                    if d:IsA("ProximityPrompt") then
+                        if typeof(fireproximityprompt) == "function" then
+                            pcall(function() fireproximityprompt(d) end)
+                        else
+                            pcall(function()
+                                d.HoldDuration = 0
+                                d:InputHoldBegin(); task.wait(0.1); d:InputHoldEnd()
+                            end)
+                        end
+                        task.wait(0.3)
+                    end
+                end
+                -- give the server a moment; standing on it covers touch-based switches
+                local t0 = os.clock()
+                while os.clock() - t0 < 3 do
+                    if s:GetAttribute("Pulled") == true then break end
+                    task.wait(0.25)
+                end
+            end
+        end
+    end
+    return allPulled
+end
+
+-- TP into the dungeon's spawn point
+local function gotoDungeonSpawn()
+    local area = getDungeonArea()
+    local sp = area and area:FindFirstChild("Spawn")
+    if not sp then return false end
+    local pos
+    if sp:IsA("Model") then pos = sp:GetPivot().Position
+    elseif sp:IsA("BasePart") then pos = sp.Position end
+    if not pos then return false end
+    pcall(function()
+        hrp.CFrame = CFrame.new(pos + Vector3.new(0, 4, 0))
+        hrp.AssemblyLinearVelocity = Vector3.zero
+    end)
+    return true
+end
+
+-- ── Auto Quest (progress farming) ──────────────────────────
+-- From Dex captures:
+--   Definitions: ReplicatedStorage.Quests.{Normal|Daily|Angler}.<Quest>
+--     .Requirements.<TargetName> (IntValue = how many needed)
+--     .QuestType (e.g. "DefeatEnemies"), .Rewards, .Repeatable
+--   Your progress: Players.<you>.Quests.<Quest>.Requirements.<TargetName>
+-- Accepting/turning in goes through the NPC dialogue (remote not yet
+-- captured), so v1 farms the KILLS for whatever quests you've accepted;
+-- you talk to the NPC to accept and to turn in.
+local function findQuestDef(questName)
+    local defs = RS:FindFirstChild("Quests")
+    if not defs then return nil end
+    for _, cat in ipairs(defs:GetChildren()) do
+        local q = cat:FindFirstChild(questName)
+        if q then return q end
+    end
+    return nil
+end
+
+-- Array of {quest, target, cur, req, done, farmable}
+local function getQuestRequirements()
+    local out = {}
+    local pq = player:FindFirstChild("Quests")
+    if not pq then return out end
+    for _, q in ipairs(pq:GetChildren()) do
+        local reqs = q:FindFirstChild("Requirements")
+        if reqs then
+            local def = findQuestDef(q.Name)
+            local defReqs = def and def:FindFirstChild("Requirements")
+            for _, r in ipairs(reqs:GetChildren()) do
+                if r:IsA("IntValue") or r:IsA("NumberValue") then
+                    local dr = defReqs and defReqs:FindFirstChild(r.Name)
+                    local req = (dr and (dr:IsA("IntValue") or dr:IsA("NumberValue"))) and dr.Value or nil
+                    -- complete if counted up to req, or counted down to 0
+                    local done = (req and r.Value >= req) or r.Value <= 0
+                    out[#out+1] = {
+                        quest = q.Name, target = r.Name,
+                        cur = r.Value, req = req,
+                        done = done,
+                        farmable = allMobSet[r.Name] == true,
+                    }
+                end
+            end
+        end
+    end
+    return out
+end
+
+-- Set of enemy names still needed by active quests
+local function questKillSet()
+    local set = {}
+    for _, r in ipairs(getQuestRequirements()) do
+        if r.farmable and not r.done then set[r.target] = true end
+    end
+    return set
+end
+
+local function getQuestTargets()
+    local list = {}
+    local wanted = questKillSet()
+    if next(wanted) == nil then return list end
+    for _, folder in ipairs(collectEnemyFolders()) do
+        for _, obj in ipairs(folder:GetChildren()) do
+            if obj:IsA("Model") and wanted[obj.Name] then
+                local eHum = obj:FindFirstChildOfClass("Humanoid")
+                local part = getRootPart(obj)
+                if eHum and eHum.Health > 0 and part then
+                    list[#list+1] = {obj=obj, part=part, hum=eHum}
+                end
+            end
+        end
+    end
+    return list
+end
+
+-- ── Quest accept / turn-in (via captured DialogEvent) ──────
+local questNPCCache = {}   -- [questName] = npc instance that accepted it
+
+local function questActive(qname)
+    local pq = player:FindFirstChild("Quests")
+    return pq and pq:FindFirstChild(qname) ~= nil
+end
+
+-- Some quest defs may name their giver; use it when present
+local function questGiverFromDef(qname)
+    local def = findQuestDef(qname)
+    if not def then return nil end
+    for _, v in ipairs(def:GetChildren()) do
+        if v:IsA("StringValue") and (v.Name == "NPC" or v.Name == "Giver"
+            or v.Name == "QuestGiver" or v.Name == "From") then
+            local npcs = workspace:FindFirstChild("NPCs")
+            local m = npcs and npcs:FindFirstChild(v.Value)
+            if m then return m end
+        end
+    end
+    return nil
+end
+
+local function npcPos(n)
+    if n:IsA("Model") then return n:GetPivot().Position
+    elseif n:IsA("BasePart") then return n.Position end
+    return nil
+end
+
+local function fireDialog(npc, action, qname)
+    if not DialogEvent then return end
+    pcall(function() DialogEvent:FireServer(npc, action, { QuestName = qname }) end)
+end
+
+-- Accept: TP to giver (or crawl all NPCs), fire StartQuest, verify it appears
+local function acceptQuest(qname)
+    if questActive(qname) then return true, "already active" end
+    if not DialogEvent then return false, "DialogEvent remote not found" end
+    local npcs = workspace:FindFirstChild("NPCs")
+    if not npcs then return false, "workspace.NPCs not found" end
+    local origin = hrp.CFrame
+
+    local function tryNPC(npc)
+        local p = npcPos(npc)
+        if not p then return false end
+        pcall(function()
+            hrp.CFrame = CFrame.new(p + Vector3.new(0, 3, 3))
+            hrp.AssemblyLinearVelocity = Vector3.zero
+        end)
+        task.wait(0.25)
+        fireDialog(npc, "StartQuest", qname)
+        task.wait(0.45)
+        if questActive(qname) then questNPCCache[qname] = npc; return true end
+        return false
+    end
+
+    local known = questNPCCache[qname] or questGiverFromDef(qname)
+    if known and tryNPC(known) then
+        pcall(function() hrp.CFrame = origin end)
+        return true, "accepted at " .. known.Name
+    end
+    for _, npc in ipairs(npcs:GetChildren()) do
+        if tryNPC(npc) then
+            pcall(function() hrp.CFrame = origin end)
+            return true, "accepted at " .. npc.Name
+        end
+    end
+    pcall(function() hrp.CFrame = origin end)
+    return false, "no NPC accepted it (server may require quest prerequisites)"
+end
+
+-- Turn-in action string wasn't captured; try likely candidates and VERIFY
+-- (success = the quest leaves Player.Quests). Harmless if server ignores them.
+local TURNIN_ACTIONS = { "CompleteQuest","FinishQuest","TurnInQuest","ClaimQuest","EndQuest","RedeemQuest" }
+
+local function questAllDone(qname)
+    local found, all = false, true
+    for _, r in ipairs(getQuestRequirements()) do
+        if r.quest == qname then
+            found = true
+            if not r.done then all = false end
+        end
+    end
+    return found and all
+end
+
+local function tryTurnIn(qname, knownOnly)
+    if not DialogEvent then return false, "DialogEvent remote not found" end
+    local origin = hrp.CFrame
+    local known = questNPCCache[qname] or questGiverFromDef(qname)
+    local cands
+    if known then cands = { known }
+    elseif knownOnly then return false, "turn-in NPC unknown — use the manual button once"
+    else
+        local npcs = workspace:FindFirstChild("NPCs")
+        cands = npcs and npcs:GetChildren() or {}
+    end
+    for _, n in ipairs(cands) do
+        local p = npcPos(n)
+        if p then
+            pcall(function()
+                hrp.CFrame = CFrame.new(p + Vector3.new(0, 3, 3))
+                hrp.AssemblyLinearVelocity = Vector3.zero
+            end)
+            task.wait(0.25)
+            for _, act in ipairs(TURNIN_ACTIONS) do
+                fireDialog(n, act, qname)
+                task.wait(0.35)
+                if not questActive(qname) then
+                    questNPCCache[qname] = n
+                    pcall(function() hrp.CFrame = origin end)
+                    return true, n.Name .. " via " .. act
+                end
+            end
+        end
+    end
+    pcall(function() hrp.CFrame = origin end)
+    return false, "no action worked — SimpleSpy a manual turn-in and send it"
+end
+
+-- Auto turn-in loop (cautious: known NPCs only, 30s retry spacing)
+local turnInAttemptAt = {}
+task.spawn(function()
+    while task.wait(5) do
+        if autoTurnIn then
+            local pq = player:FindFirstChild("Quests")
+            if pq then
+                for _, q in ipairs(pq:GetChildren()) do
+                    local nm = q.Name
+                    if questAllDone(nm) and (os.clock() - (turnInAttemptAt[nm] or 0)) > 30 then
+                        turnInAttemptAt[nm] = os.clock()
+                        local ok, msg = tryTurnIn(nm, true)
+                        questActionMsg = (ok and "Turned in: " or "Turn-in: ") .. nm .. " — " .. tostring(msg)
+                    end
+                end
+            end
+        end
+    end
+end)
+
 -- ── Death recovery ─────────────────────────────────────────
-local function farmingActive() return autoKill or autoOre or autoWood end
+local function farmingActive() return autoKill or autoOre or autoWood or autoDungeon or autoQuest end
 
 local function anyTargetLoaded()
-    if autoKill then return #getMobTargets() > 0
+    if autoDungeon then return #getDungeonTargets() > 0
+    elseif autoQuest then return #getQuestTargets() > 0
+    elseif autoKill then return #getMobTargets() > 0
     elseif autoWood then return #getResourceTargets("wood") > 0
     elseif autoOre then return #getResourceTargets("ore") > 0 end
     return false
@@ -387,10 +810,38 @@ task.spawn(function()
             if needRecover then task.wait(0.2); return end
 
             local mode  = currentMode()
-            local isMob = autoKill
+            local isMob = autoKill or autoDungeon or autoQuest
+
+            -- Auto Dungeon pre-phases
+            if autoDungeon then
+                local def = DUNGEONS[dungeonChoice]
+                local area = getDungeonArea()
+                if not area then
+                    dungeonStatus = "area not loaded — walk/TP near the dungeon"
+                    task.wait(0.5); return
+                end
+                -- completion check: boss was seen and is now gone
+                if dungeonBossWasSeen and not dungeonBossAlive() and #getDungeonTargets() == 0 then
+                    dungeonStatus = "COMPLETE — boss down!"
+                    task.wait(1); return
+                end
+                if def and def.hasSwitches then
+                    if not pullSwitches() then
+                        task.wait(0.3); return   -- still pulling; loop re-enters
+                    end
+                end
+                if dungeonBossAlive() then
+                    dungeonBossWasSeen = true
+                    dungeonStatus = "fighting boss — " .. dungeonKillText()
+                else
+                    dungeonStatus = "clearing — " .. dungeonKillText()
+                end
+            end
 
             local targets
-            if autoKill then targets = getMobTargets()
+            if autoDungeon then targets = getDungeonTargets()
+            elseif autoQuest then targets = getQuestTargets()
+            elseif autoKill then targets = getMobTargets()
             elseif autoWood then targets = getResourceTargets("wood")
             else targets = getResourceTargets("ore") end
 
@@ -556,27 +1007,30 @@ end)
 -- ══════════════════════════════════════════════════════════
 local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
 local Window = Rayfield:CreateWindow({
-    Name = "Autofarm v11",
+    Name = "Autofarm v14",
     LoadingTitle = "Loading...",
-    LoadingSubtitle = "Self-calibrating boss cooldowns",
+    LoadingSubtitle = "Respawn vs summon tracking",
     ConfigurationSaving = { Enabled = false },
     KeySystem = false
 })
 
-local TabInfo   = Window:CreateTab("Info")
-local TabOre    = Window:CreateTab("Auto Ore")
-local TabTPs    = Window:CreateTab("Teleports")
-local TabCombat = Window:CreateTab("Combat")
-local TabWood   = Window:CreateTab("Auto Wood")
-local TabTimers = Window:CreateTab("Boss Timers")
-local TabExtras = Window:CreateTab("Extras")
-local TabESP    = Window:CreateTab("Mob ESP")
+local TabInfo    = Window:CreateTab("Info")
+local TabOre     = Window:CreateTab("Auto Ore")
+local TabTPs     = Window:CreateTab("Teleports")
+local TabCombat  = Window:CreateTab("Combat")
+local TabWood    = Window:CreateTab("Auto Wood")
+local TabDungeon = Window:CreateTab("Auto Dungeon")
+local TabQuest   = Window:CreateTab("Auto Quest")
+local TabTimers  = Window:CreateTab("Boss Timers")
+local TabExtras  = Window:CreateTab("Extras")
+local TabESP     = Window:CreateTab("Mob ESP")
 
-TabInfo:CreateParagraph({ Title = "v10 — Complete Roster", Content =
-    "Full enemy list pulled straight from the game's Enemies folder (exact\n" ..
-    "names), alphabetical, bosses separated. Master toggles still catch anything.\n" ..
-    "Boss Timers tab tracks 15-min respawns (auto when in-area, or Mark killed)."
-})
+TabInfo:CreateParagraph({ Title = "v14 — Full Quest Automation", Content =
+    "NEW: Auto Dungeon tab clears Duke Cublindor's Domain / The Grand Beehive\n" ..
+    "(switches, kill stages, boss) hands-free once you're inside. Auto Quest\n" ..
+    "tab reads your accepted quests and farms exactly the kills they need.\n" ..
+    "Boss Timers split into respawn minibosses (Cylindery ~64s) and summon\n" ..
+    "cooldowns (~15m), both self-calibrating from observation." })
 
 -- ── Auto Ore ───────────────────────────────────────────────
 TabOre:CreateSection("Master")
@@ -642,30 +1096,190 @@ for _, w in ipairs(woodNames) do
         end })
 end
 
+-- ── Auto Dungeon ───────────────────────────────────────────
+TabDungeon:CreateParagraph({ Title="How it works", Content=
+    "1) Walk or TP into the dungeon and start the run as normal.\n" ..
+    "2) Pick the dungeon below and flip Auto Dungeon ON.\n" ..
+    "The script TPs to the dungeon spawn, pulls the Beehive's 4 switches if\n" ..
+    "needed, kills everything that spawns (DungeonKills S1 20 / S2 20 / S3 25 in\n" ..
+    "Duke's; doubled when enraged), then kills the boss when he spawns. Works\n" ..
+    "for Lord Cublindor / Blazing Jimbee too. Status shows live progress." })
+
+TabDungeon:CreateSection("Dungeon")
+TabDungeon:CreateDropdown({
+    Name = "Select Dungeon",
+    Options = { "Duke Cublindor's Domain", "The Grand Beehive" },
+    CurrentOption = { "Duke Cublindor's Domain" },
+    Flag = "DungeonPick",
+    Callback = function(opt)
+        local pick = typeof(opt) == "table" and opt[1] or opt
+        if pick == "The Grand Beehive" then dungeonChoice = "BeeHiveArea"
+        else dungeonChoice = "CublinDungeon" end
+    end
+})
+
+TabDungeon:CreateToggle({ Name="Auto Dungeon", CurrentValue=false, Flag="AutoDungeon",
+    Callback=function(v)
+        autoDungeon = v
+        if v then
+            -- dungeon overrides other farm modes
+            autoQuest = false
+            killAll=false; mineAll=false; chopAll=false
+            selEnemies = {}; selOres = {}; selWood = {}
+            recompute()
+            dungeonBossWasSeen = false
+            dungeonStatus = "starting..."
+            task.spawn(gotoDungeonSpawn)
+        else
+            dungeonStatus = "idle"
+        end
+    end })
+
+TabDungeon:CreateSection("Status")
+local dungeonLabel = TabDungeon:CreateLabel("Status: idle")
+TabDungeon:CreateButton({ Name="Start Dungeon Run (experimental)", Callback=function()
+    task.spawn(function()
+        local r = findRemote("StartDungeon")
+        if not r then dungeonStatus = "StartDungeon remote not found"; return end
+        local area = getDungeonArea()
+        local def = DUNGEONS[dungeonChoice]
+        dungeonStatus = "firing StartDungeon..."
+        -- args weren't captured; try sensible patterns, server ignores bad ones
+        if area then callRemote(r, area) end
+        task.wait(0.4)
+        callRemote(r, dungeonChoice)
+        task.wait(0.4)
+        if def then callRemote(r, def.label) end
+        task.wait(0.4)
+        callRemote(r)
+        dungeonStatus = "StartDungeon fired — if no run starts, SimpleSpy a manual start"
+    end)
+end })
+task.spawn(function()
+    while task.wait(1) do
+        local def = DUNGEONS[dungeonChoice]
+        local nm = def and def.label or dungeonChoice
+        pcall(function()
+            dungeonLabel:Set(string.format("[%s] %s", nm, dungeonStatus))
+        end)
+    end
+end)
+
+
+-- ── Auto Quest ─────────────────────────────────────────────
+TabQuest:CreateParagraph({ Title="How it works", Content=
+    "Pick a quest and hit Accept — the script fires the game's DialogEvent\n" ..
+    "(StartQuest) at the right NPC, crawling workspace.NPCs and verifying the\n" ..
+    "quest lands in Player.Quests. Auto-Farm then kills exactly what the\n" ..
+    "quest needs (e.g. the Cubey Bandit chain for the Duke banner). Turn-in\n" ..
+    "tries likely DialogEvent actions and verifies; if none work, SimpleSpy a\n" ..
+    "manual turn-in once and send it. Non-kill requirements are skipped." })
+
+TabQuest:CreateSection("Control")
+TabQuest:CreateToggle({ Name="Auto-Farm Active Quest Targets", CurrentValue=false, Flag="AutoQuest",
+    Callback=function(v)
+        autoQuest = v
+        if v then
+            autoDungeon = false
+            killAll=false; mineAll=false; chopAll=false
+            selEnemies = {}; selOres = {}; selWood = {}
+            autoKill=false; autoOre=false; autoWood=false
+        end
+    end })
+TabQuest:CreateToggle({ Name="Auto Turn-In completed quests", CurrentValue=false, Flag="AutoTurnIn",
+    Callback=function(v) autoTurnIn = v end })
+
+TabQuest:CreateSection("Accept / Turn In")
+local questOptions = {}
+do
+    local defs = RS:FindFirstChild("Quests")
+    local normal = defs and defs:FindFirstChild("Normal")
+    if normal then
+        for _, q in ipairs(normal:GetChildren()) do questOptions[#questOptions+1] = q.Name end
+        table.sort(questOptions)
+    end
+    if #questOptions == 0 then questOptions = { "(no quests found)" } end
+end
+local selectedQuest = questOptions[1]
+TabQuest:CreateDropdown({ Name="Quest", Options=questOptions, CurrentOption={questOptions[1]}, Flag="QuestPick",
+    Callback=function(opt) selectedQuest = typeof(opt)=="table" and opt[1] or opt end })
+TabQuest:CreateButton({ Name="Accept Selected Quest", Callback=function()
+    task.spawn(function()
+        questActionMsg = "Accepting '" .. tostring(selectedQuest) .. "'..."
+        local ok, msg = acceptQuest(selectedQuest)
+        questActionMsg = (ok and "Accepted: " or "Accept failed: ") .. tostring(msg)
+    end)
+end })
+TabQuest:CreateButton({ Name="Turn In Selected Quest (tries action names)", Callback=function()
+    task.spawn(function()
+        questActionMsg = "Turning in '" .. tostring(selectedQuest) .. "'..."
+        local ok, msg = tryTurnIn(selectedQuest, false)
+        questActionMsg = (ok and "Turned in: " or "Turn-in failed: ") .. tostring(msg)
+    end)
+end })
+local questActionLabel = TabQuest:CreateLabel("Last action: —")
+task.spawn(function()
+    while task.wait(1) do
+        if questActionMsg ~= "" then
+            pcall(function() questActionLabel:Set("Last action: " .. questActionMsg) end)
+        end
+    end
+end)
+
+TabQuest:CreateSection("Active Quests")
+local questLabel = TabQuest:CreateLabel("No active quests found.")
+task.spawn(function()
+    while task.wait(1.5) do
+        local reqs = getQuestRequirements()
+        local txt
+        if #reqs == 0 then
+            txt = "No active quests found."
+        else
+            local lines = {}
+            for _, r in ipairs(reqs) do
+                local reqTxt = r.req and tostring(r.req) or "?"
+                local mark = r.done and "DONE" or (r.farmable and "farming" or "not auto-farmable")
+                lines[#lines+1] = string.format("%s: %s %d/%s [%s]", r.quest, r.target, r.cur, reqTxt, mark)
+            end
+            txt = table.concat(lines, "  |  ")
+        end
+        pcall(function() questLabel:Set(txt) end)
+    end
+end)
+
 -- ── Boss Timers ────────────────────────────────────────────
 TabTimers:CreateParagraph({ Title="How it works", Content=
-    "These bosses are SUMMONED (item / dungeon / enrage) on a cooldown, not auto-\n" ..
-    "respawning. Default cooldown is 15 min (wiki: Duke, Enormous Ballzo, Lord\n" ..
-    "Cublindor, Blazing Jimbee). While you're in a boss's area the script measures\n" ..
-    "the real death->reappear time and CALIBRATES that boss automatically (shows\n" ..
-    "'measured'). Out of area, hit 'Mark killed' to start the cooldown manually." })
-TabTimers:CreateSlider({ Name="Default cooldown (min)", Range={1,60}, Increment=1, CurrentValue=15, Flag="BossInt",
+    "Two kinds of tracked bosses:\n" ..
+    "• RESPAWN minibosses: Cylindery auto-respawns at his shrine every ~64s\n" ..
+    "  (wiki-sourced) — the timer shows when he should be up again.\n" ..
+    "• SUMMON bosses (Crab Champion, Duke, Enormous Ballzo, Glacier Giant,\n" ..
+    "  Jimbee, Musheynator, Orbdenier, Pharaoh's Curse) only appear when\n" ..
+    "  summoned — the timer shows the ~15 min summon cooldown (wiki-sourced).\n" ..
+    "In-area, the script measures the real gone->reappear time and calibrates\n" ..
+    "itself ('measured'). Out of area, use 'Mark killed' to start it manually." })
+TabTimers:CreateSlider({ Name="Summon cooldown default (min)", Range={1,60}, Increment=1, CurrentValue=15, Flag="BossInt",
     Callback=function(v)
-        -- set the default for any boss not yet calibrated from observation
-        for _, name in ipairs(TIMER_BOSSES) do
+        -- adjusts only summon bosses that haven't been calibrated from observation
+        -- (Cylindery's 64s respawn default is sourced and stays untouched)
+        for _, name in ipairs(SUMMON_BOSSES) do
             local st = bossState[name]
             if not st.measured then st.interval = v*60 end
         end
     end })
 
-TabTimers:CreateSection("Status")
 local bossLabels = {}
-for _, name in ipairs(TIMER_BOSSES) do
+TabTimers:CreateSection("Respawn Minibosses")
+for _, name in ipairs(RESPAWN_MINIBOSSES) do
+    bossLabels[name] = TabTimers:CreateLabel(name .. ": --")
+end
+
+TabTimers:CreateSection("Summon Boss Cooldowns")
+for _, name in ipairs(SUMMON_BOSSES) do
     bossLabels[name] = TabTimers:CreateLabel(name .. ": --")
 end
 
 TabTimers:CreateSection("Mark Killed (manual)")
-for _, name in ipairs(TIMER_BOSSES) do
+for _, name in ipairs(TRACKED_NAMES) do
     TabTimers:CreateButton({ Name="Mark "..name.." killed", Callback=function()
         local st = bossState[name]
         st.seen = false
@@ -675,24 +1289,43 @@ for _, name in ipairs(TIMER_BOSSES) do
 end
 
 -- live updater for boss timer labels
+local function fmtCD(sec)
+    if sec < 120 then return string.format("%ds", sec) end
+    return string.format("%dm", math.floor(sec/60))
+end
 task.spawn(function()
     while task.wait(1) do
-        for _, name in ipairs(TIMER_BOSSES) do
+        for _, name in ipairs(TRACKED_NAMES) do
             local st = bossState[name]
             local tag = st.measured and "measured" or "default"
-            local cdm = math.floor(st.interval/60)
+            local cds = fmtCD(st.interval)
             local txt
-            if st.seen then
-                txt = string.format("%s: ALIVE NOW  (cd ~%dm, %s)", name, cdm, tag)
-            elseif st.nextReady then
-                local rem = st.nextReady - os.time()
-                if rem <= 0 then
-                    txt = string.format("%s: READY  (cd ~%dm, %s)", name, cdm, tag)
+            if st.kind == "respawn" then
+                if st.seen then
+                    txt = string.format("%s: UP NOW  (~%s respawn, %s)", name, cds, tag)
+                elseif st.nextReady then
+                    local rem = st.nextReady - os.time()
+                    if rem <= 0 then
+                        txt = string.format("%s: SHOULD BE UP  (~%s, %s)", name, cds, tag)
+                    else
+                        txt = string.format("%s: respawns in %d:%02d  (~%s, %s)", name, math.floor(rem/60), rem%60, cds, tag)
+                    end
                 else
-                    txt = string.format("%s: %d:%02d  (cd ~%dm, %s)", name, math.floor(rem/60), rem%60, cdm, tag)
+                    txt = string.format("%s: -- no data yet  (~%s respawn, %s)", name, cds, tag)
                 end
-            else
-                txt = string.format("%s: -- no data yet  (cd ~%dm, %s)", name, cdm, tag)
+            else -- summon
+                if st.seen then
+                    txt = string.format("%s: ALIVE NOW  (summon cd ~%s, %s)", name, cds, tag)
+                elseif st.nextReady then
+                    local rem = st.nextReady - os.time()
+                    if rem <= 0 then
+                        txt = string.format("%s: SUMMON READY  (cd ~%s, %s)", name, cds, tag)
+                    else
+                        txt = string.format("%s: summonable in %d:%02d  (cd ~%s, %s)", name, math.floor(rem/60), rem%60, cds, tag)
+                    end
+                else
+                    txt = string.format("%s: -- no data yet  (summon cd ~%s, %s)", name, cds, tag)
+                end
             end
             pcall(function() bossLabels[name]:Set(txt) end)
         end

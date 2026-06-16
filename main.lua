@@ -1,5 +1,5 @@
 -- ============================================================
---  Autofarm Script v14 — Full Quest Automation
+--  Autofarm Script v15 — Auto Harvest + Quest/Dungeon polish
 -- ============================================================
 -- NEW IN v10:
 --  • FULL enemy list pulled from ReplicatedStorage.Enemies (exact in-game
@@ -49,10 +49,11 @@ end
 
 -- ── State ──────────────────────────────────────────────────
 local autoOre, autoWood, autoKill = false, false, false
+local autoHarvest = false              -- shears/scissors harvesting
+local harvestAll = false               -- harvest every bush/plant found
 local autoDungeon = false        -- Auto Dungeon mode (overrides other farming)
 local autoQuest   = false        -- Auto-farm active quest kill targets
-local autoTurnIn  = false        -- Auto turn-in completed quests (known NPCs)
-local questActionMsg = ""        -- last accept/turn-in result for the UI
+local questActionMsg = ""        -- last accept result for the UI
 local dungeonChoice = "CublinDungeon"  -- which dungeon to run
 local mineAll, chopAll, killAll   = false, false, false
 local noCooldown, infiniteJump, espEnabled = false, false, false
@@ -70,6 +71,7 @@ local needRecover = false
 local lastEquipped = {}
 
 local selOres, selWood, selEnemies = {}, {}, {}
+local selHarvest = {}
 local espCache = {}
 
 -- ── Content lists (exact names from ReplicatedStorage.Enemies) ──
@@ -178,6 +180,20 @@ local function isWoodName(nm)
     return nm:find("Stump") ~= nil or nm:find("Tree") ~= nil or nm:find("Log") ~= nil
 end
 
+-- Harvestables (shears/scissors/sickles) — live in CurrentResources like ores.
+-- Names below are the in-game resource Model names (PrimaryPart "Center").
+local harvestNames = {
+    "Bitterberry Bush","Blackberry Bush","Blueberry Bush","Cola Berry Bush",
+    "Coconut","Elderberry Bush","Frostberry Bush","Golden Coconut",
+    "Gummyberry Bush","Strawberry Bush","Wheat"
+}
+local function isHarvestName(nm)
+    local low = nm:lower()
+    return low:find("bush") ~= nil or low:find("berry") ~= nil
+        or low:find("coconut") ~= nil or low:find("strawberry") ~= nil
+        or low:find("wheat") ~= nil
+end
+
 local CHAR_PART = {
     Humanoid=true, HumanoidRootPart=true, Head=true, Torso=true, UpperTorso=true, LowerTorso=true,
     ["Left Arm"]=true, ["Right Arm"]=true, ["Left Leg"]=true, ["Right Leg"]=true,
@@ -211,9 +227,11 @@ local function getEquipped()
 end
 
 local function currentMode()
-    if autoDungeon or autoQuest then return "kill"  -- both use the weapon memory
+    if autoDungeon then return "kill"     -- dungeon uses the weapon memory
+    elseif autoQuest then return "kill"   -- quest farm picks tool per target
     elseif autoKill then return "kill"
     elseif autoWood then return "wood"
+    elseif autoHarvest then return "harvest"
     elseif autoOre then return "ore" end
     return nil
 end
@@ -301,9 +319,13 @@ local function getResourceTargets(kind)
                     local nm = res.Name
                     local include = false
                     if kind == "ore" then
-                        if mineAll then include = not isWoodName(nm) else include = selOres[nm] == true end
-                    else
+                        -- mineAll = everything that isn't wood and isn't a harvestable
+                        if mineAll then include = (not isWoodName(nm)) and (not isHarvestName(nm))
+                        else include = selOres[nm] == true end
+                    elseif kind == "wood" then
                         if chopAll then include = isWoodName(nm) else include = selWood[nm] == true end
+                    else -- harvest
+                        if harvestAll then include = isHarvestName(nm) else include = selHarvest[nm] == true end
                     end
                     if include then
                         local part = getRootPart(res)
@@ -328,11 +350,12 @@ local function getClosest(list)
 end
 
 local function recompute()
-    autoKill = killAll or (next(selEnemies) ~= nil)
-    autoOre  = mineAll or (next(selOres) ~= nil)
-    autoWood = chopAll or (next(selWood) ~= nil)
+    autoKill    = killAll or (next(selEnemies) ~= nil)
+    autoOre     = mineAll or (next(selOres) ~= nil)
+    autoWood    = chopAll or (next(selWood) ~= nil)
+    autoHarvest = harvestAll or (next(selHarvest) ~= nil)
     -- enabling any normal farm mode takes over from Auto Dungeon / Auto Quest
-    if autoKill or autoOre or autoWood then autoDungeon = false; autoQuest = false end
+    if autoKill or autoOre or autoWood or autoHarvest then autoDungeon = false; autoQuest = false end
 end
 
 -- ── Boss timer monitor ─────────────────────────────────────
@@ -535,6 +558,65 @@ local function gotoDungeonSpawn()
     return true
 end
 
+-- A dungeon run is active when the area's "Running" attribute is true
+local function dungeonRunning(area)
+    area = area or getDungeonArea()
+    if not area then return false end
+    return area:GetAttribute("Running") == true
+end
+
+-- Find the red "start" zone you stand in to begin the run. Tries common names,
+-- then a reddish part, then falls back to the Spawn point.
+local function getStartZonePos()
+    local area = getDungeonArea()
+    if not area then return nil end
+    local keys = { "start", "begin", "trigger", "enter", "pad", "portal", "red", "activate" }
+    local reddish
+    for _, d in ipairs(area:GetDescendants()) do
+        if d:IsA("BasePart") then
+            local low = d.Name:lower()
+            for _, k in ipairs(keys) do
+                if low:find(k) then return d.Position end
+            end
+            local c = d.Color
+            if not reddish and c.R > 0.55 and c.G < 0.35 and c.B < 0.35 then
+                reddish = d.Position
+            end
+        end
+    end
+    if reddish then return reddish end
+    local sp = area:FindFirstChild("Spawn")
+    if sp then
+        if sp:IsA("Model") then return sp:GetPivot().Position
+        elseif sp:IsA("BasePart") then return sp.Position end
+    end
+    return nil
+end
+
+-- Stand in the start zone until the run begins (Running flips true / enemies appear)
+local function holdInStartZone(area)
+    local pos = getStartZonePos()
+    if not pos then dungeonStatus = "can't find start zone — stand in the red pad"; task.wait(0.5); return end
+    local t0 = os.clock()
+    while autoDungeon and not needRecover do
+        if dungeonRunning(area) or dungeonBossAlive() or #getDungeonTargets() > 0 then
+            dungeonStatus = "run started!"
+            return
+        end
+        local waited = math.floor(os.clock() - t0)
+        dungeonStatus = string.format("standing in start zone... %ds (wait ~30s)", waited)
+        pcall(function()
+            hrp.CFrame = CFrame.new(pos + Vector3.new(0, 3, 0))
+            hrp.AssemblyLinearVelocity = Vector3.zero
+        end)
+        task.wait(0.5)
+        if os.clock() - t0 > 60 then
+            dungeonStatus = "no run after 60s — is this the right dungeon / spot?"
+            return
+        end
+    end
+end
+
 -- ── Auto Quest (progress farming) ──────────────────────────
 -- From Dex captures:
 --   Definitions: ReplicatedStorage.Quests.{Normal|Daily|Angler}.<Quest>
@@ -570,11 +652,14 @@ local function getQuestRequirements()
                     local req = (dr and (dr:IsA("IntValue") or dr:IsA("NumberValue"))) and dr.Value or nil
                     -- complete if counted up to req, or counted down to 0
                     local done = (req and r.Value >= req) or r.Value <= 0
+                    local isKill    = allMobSet[r.Name] == true
+                    local isHarvest = (not isKill) and isHarvestName(r.Name)
                     out[#out+1] = {
                         quest = q.Name, target = r.Name,
                         cur = r.Value, req = req,
                         done = done,
-                        farmable = allMobSet[r.Name] == true,
+                        farmable = isKill or isHarvest,
+                        harvest = isHarvest,
                     }
                 end
             end
@@ -583,26 +668,47 @@ local function getQuestRequirements()
     return out
 end
 
--- Set of enemy names still needed by active quests
-local function questKillSet()
-    local set = {}
+-- Sets of still-needed quest targets, split by how they're farmed
+local function questNeeds()
+    local kills, harvests = {}, {}
     for _, r in ipairs(getQuestRequirements()) do
-        if r.farmable and not r.done then set[r.target] = true end
+        if r.farmable and not r.done then
+            if r.harvest then harvests[r.target] = true else kills[r.target] = true end
+        end
     end
-    return set
+    return kills, harvests
 end
 
 local function getQuestTargets()
     local list = {}
-    local wanted = questKillSet()
-    if next(wanted) == nil then return list end
-    for _, folder in ipairs(collectEnemyFolders()) do
-        for _, obj in ipairs(folder:GetChildren()) do
-            if obj:IsA("Model") and wanted[obj.Name] then
-                local eHum = obj:FindFirstChildOfClass("Humanoid")
-                local part = getRootPart(obj)
-                if eHum and eHum.Health > 0 and part then
-                    list[#list+1] = {obj=obj, part=part, hum=eHum}
+    local kills, harvests = questNeeds()
+    if next(kills) ~= nil then
+        for _, folder in ipairs(collectEnemyFolders()) do
+            for _, obj in ipairs(folder:GetChildren()) do
+                if obj:IsA("Model") and kills[obj.Name] then
+                    local eHum = obj:FindFirstChildOfClass("Humanoid")
+                    local part = getRootPart(obj)
+                    if eHum and eHum.Health > 0 and part then
+                        list[#list+1] = {obj=obj, part=part, hum=eHum, harvest=false}
+                    end
+                end
+            end
+        end
+    end
+    if next(harvests) ~= nil then
+        local spawns = workspace:FindFirstChild("ResourceSpawns")
+        if spawns then
+            for _, region in ipairs(spawns:GetChildren()) do
+                for _, node in ipairs(region:GetChildren()) do
+                    local cr = node:FindFirstChild("CurrentResources")
+                    if cr then
+                        for _, res in ipairs(cr:GetChildren()) do
+                            if harvests[res.Name] then
+                                local part = getRootPart(res)
+                                if part then list[#list+1] = {obj=res, part=part, harvest=true} end
+                            end
+                        end
+                    end
                 end
             end
         end
@@ -681,83 +787,19 @@ local function acceptQuest(qname)
     return false, "no NPC accepted it (server may require quest prerequisites)"
 end
 
--- Turn-in action string wasn't captured; try likely candidates and VERIFY
--- (success = the quest leaves Player.Quests). Harmless if server ignores them.
-local TURNIN_ACTIONS = { "CompleteQuest","FinishQuest","TurnInQuest","ClaimQuest","EndQuest","RedeemQuest" }
-
-local function questAllDone(qname)
-    local found, all = false, true
-    for _, r in ipairs(getQuestRequirements()) do
-        if r.quest == qname then
-            found = true
-            if not r.done then all = false end
-        end
-    end
-    return found and all
-end
-
-local function tryTurnIn(qname, knownOnly)
-    if not DialogEvent then return false, "DialogEvent remote not found" end
-    local origin = hrp.CFrame
-    local known = questNPCCache[qname] or questGiverFromDef(qname)
-    local cands
-    if known then cands = { known }
-    elseif knownOnly then return false, "turn-in NPC unknown — use the manual button once"
-    else
-        local npcs = workspace:FindFirstChild("NPCs")
-        cands = npcs and npcs:GetChildren() or {}
-    end
-    for _, n in ipairs(cands) do
-        local p = npcPos(n)
-        if p then
-            pcall(function()
-                hrp.CFrame = CFrame.new(p + Vector3.new(0, 3, 3))
-                hrp.AssemblyLinearVelocity = Vector3.zero
-            end)
-            task.wait(0.25)
-            for _, act in ipairs(TURNIN_ACTIONS) do
-                fireDialog(n, act, qname)
-                task.wait(0.35)
-                if not questActive(qname) then
-                    questNPCCache[qname] = n
-                    pcall(function() hrp.CFrame = origin end)
-                    return true, n.Name .. " via " .. act
-                end
-            end
-        end
-    end
-    pcall(function() hrp.CFrame = origin end)
-    return false, "no action worked — SimpleSpy a manual turn-in and send it"
-end
-
--- Auto turn-in loop (cautious: known NPCs only, 30s retry spacing)
-local turnInAttemptAt = {}
-task.spawn(function()
-    while task.wait(5) do
-        if autoTurnIn then
-            local pq = player:FindFirstChild("Quests")
-            if pq then
-                for _, q in ipairs(pq:GetChildren()) do
-                    local nm = q.Name
-                    if questAllDone(nm) and (os.clock() - (turnInAttemptAt[nm] or 0)) > 30 then
-                        turnInAttemptAt[nm] = os.clock()
-                        local ok, msg = tryTurnIn(nm, true)
-                        questActionMsg = (ok and "Turned in: " or "Turn-in: ") .. nm .. " — " .. tostring(msg)
-                    end
-                end
-            end
-        end
-    end
-end)
+-- NOTE: quests in Studlands auto-complete and auto-reward the moment their
+-- requirements are met (confirmed in-game) — there is NO turn-in step, so we
+-- don't fire any completion remote. Accept + farm is all that's needed.
 
 -- ── Death recovery ─────────────────────────────────────────
-local function farmingActive() return autoKill or autoOre or autoWood or autoDungeon or autoQuest end
+local function farmingActive() return autoKill or autoOre or autoWood or autoHarvest or autoDungeon or autoQuest end
 
 local function anyTargetLoaded()
     if autoDungeon then return #getDungeonTargets() > 0
     elseif autoQuest then return #getQuestTargets() > 0
     elseif autoKill then return #getMobTargets() > 0
     elseif autoWood then return #getResourceTargets("wood") > 0
+    elseif autoHarvest then return #getResourceTargets("harvest") > 0
     elseif autoOre then return #getResourceTargets("ore") > 0 end
     return false
 end
@@ -825,6 +867,11 @@ task.spawn(function()
                     dungeonStatus = "COMPLETE — boss down!"
                     task.wait(1); return
                 end
+                -- if no run is active yet, stand in the start zone to begin it
+                if not dungeonRunning(area) and not dungeonBossAlive() and #getDungeonTargets() == 0 then
+                    holdInStartZone(area)
+                    return
+                end
                 if def and def.hasSwitches then
                     if not pullSwitches() then
                         task.wait(0.3); return   -- still pulling; loop re-enters
@@ -843,10 +890,17 @@ task.spawn(function()
             elseif autoQuest then targets = getQuestTargets()
             elseif autoKill then targets = getMobTargets()
             elseif autoWood then targets = getResourceTargets("wood")
+            elseif autoHarvest then targets = getResourceTargets("harvest")
             else targets = getResourceTargets("ore") end
 
             local target = getClosest(targets)
             if not target then task.wait(0.25); return end
+
+            -- Auto Quest picks the right tool per target (enemy vs bush)
+            if autoQuest then
+                if target.harvest then mode = "harvest"; isMob = false
+                else mode = "kill"; isMob = true end
+            end
 
             local obj, part = target.obj, target.part
             local offset = isMob and MOB_OFFSET or RES_OFFSET
@@ -1007,7 +1061,7 @@ end)
 -- ══════════════════════════════════════════════════════════
 local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
 local Window = Rayfield:CreateWindow({
-    Name = "Autofarm v14",
+    Name = "Autofarm v15",
     LoadingTitle = "Loading...",
     LoadingSubtitle = "Respawn vs summon tracking",
     ConfigurationSaving = { Enabled = false },
@@ -1019,13 +1073,14 @@ local TabOre     = Window:CreateTab("Auto Ore")
 local TabTPs     = Window:CreateTab("Teleports")
 local TabCombat  = Window:CreateTab("Combat")
 local TabWood    = Window:CreateTab("Auto Wood")
+local TabHarvest = Window:CreateTab("Auto Harvest")
 local TabDungeon = Window:CreateTab("Auto Dungeon")
 local TabQuest   = Window:CreateTab("Auto Quest")
 local TabTimers  = Window:CreateTab("Boss Timers")
 local TabExtras  = Window:CreateTab("Extras")
 local TabESP     = Window:CreateTab("Mob ESP")
 
-TabInfo:CreateParagraph({ Title = "v14 — Full Quest Automation", Content =
+TabInfo:CreateParagraph({ Title = "v15 — Auto Harvest", Content =
     "NEW: Auto Dungeon tab clears Duke Cublindor's Domain / The Grand Beehive\n" ..
     "(switches, kill stages, boss) hands-free once you're inside. Auto Quest\n" ..
     "tab reads your accepted quests and farms exactly the kills they need.\n" ..
@@ -1035,7 +1090,7 @@ TabInfo:CreateParagraph({ Title = "v14 — Full Quest Automation", Content =
 -- ── Auto Ore ───────────────────────────────────────────────
 TabOre:CreateSection("Master")
 TabOre:CreateToggle({ Name="Mine ALL Ores", CurrentValue=false, Flag="MineAll",
-    Callback=function(v) mineAll=v; if v then chopAll=false; killAll=false end; recompute() end })
+    Callback=function(v) mineAll=v; if v then chopAll=false; killAll=false; harvestAll=false end; recompute() end })
 TabOre:CreateSection("Select Ore")
 for _, ore in ipairs(oreNames) do
     TabOre:CreateToggle({ Name = "Mine "..ore, CurrentValue = false, Flag = "Ore_"..ore,
@@ -1068,7 +1123,7 @@ TabCombat:CreateToggle({ Name="No Cooldown", CurrentValue=false, Flag="NoCooldow
 
 TabCombat:CreateSection("Master")
 TabCombat:CreateToggle({ Name="Kill ALL Enemies", CurrentValue=false, Flag="KillAll",
-    Callback=function(v) killAll=v; if v then mineAll=false; chopAll=false end; recompute() end })
+    Callback=function(v) killAll=v; if v then mineAll=false; chopAll=false; harvestAll=false end; recompute() end })
 
 TabCombat:CreateSection("Bosses")
 for _, name in ipairs(bossEnemies) do
@@ -1085,7 +1140,7 @@ end
 -- ── Auto Wood ──────────────────────────────────────────────
 TabWood:CreateSection("Master")
 TabWood:CreateToggle({ Name="Chop ALL Wood", CurrentValue=false, Flag="ChopAll",
-    Callback=function(v) chopAll=v; if v then mineAll=false; killAll=false end; recompute() end })
+    Callback=function(v) chopAll=v; if v then mineAll=false; killAll=false; harvestAll=false end; recompute() end })
 TabWood:CreateSection("Select Wood")
 for _, w in ipairs(woodNames) do
     TabWood:CreateToggle({ Name=w, CurrentValue=false, Flag="Wood_"..w,
@@ -1096,14 +1151,35 @@ for _, w in ipairs(woodNames) do
         end })
 end
 
+-- ── Auto Harvest ───────────────────────────────────────────
+TabHarvest:CreateParagraph({ Title="How it works", Content=
+    "Equip your shears / scissors / sickle once (the harvesting tool), then\n" ..
+    "flip a toggle. Works exactly like Auto Ore but for bushes, berries,\n" ..
+    "coconuts and wheat in CurrentResources. Harvest ALL grabs every bush/\n" ..
+    "plant in range; or pick specific ones below." })
+TabHarvest:CreateSection("Master")
+TabHarvest:CreateToggle({ Name="Harvest ALL Plants", CurrentValue=false, Flag="HarvestAll",
+    Callback=function(v) harvestAll=v; if v then mineAll=false; chopAll=false; killAll=false end; recompute() end })
+TabHarvest:CreateSection("Select Harvestable")
+for _, h in ipairs(harvestNames) do
+    TabHarvest:CreateToggle({ Name="Harvest "..h, CurrentValue=false, Flag="Harv_"..h,
+        Callback=function(v)
+            -- register the bush name plus a couple of likely variants
+            local variants = { h }
+            if h:find(" Bush") then variants[#variants+1] = h:gsub(" Bush","") end
+            variants[#variants+1] = h .. " Bush"
+            for _, n in ipairs(variants) do selHarvest[n] = v or nil end
+            recompute()
+        end })
+end
+
 -- ── Auto Dungeon ───────────────────────────────────────────
 TabDungeon:CreateParagraph({ Title="How it works", Content=
-    "1) Walk or TP into the dungeon and start the run as normal.\n" ..
-    "2) Pick the dungeon below and flip Auto Dungeon ON.\n" ..
-    "The script TPs to the dungeon spawn, pulls the Beehive's 4 switches if\n" ..
-    "needed, kills everything that spawns (DungeonKills S1 20 / S2 20 / S3 25 in\n" ..
-    "Duke's; doubled when enraged), then kills the boss when he spawns. Works\n" ..
-    "for Lord Cublindor / Blazing Jimbee too. Status shows live progress." })
+    "1) Pick the dungeon below and flip Auto Dungeon ON near the dungeon.\n" ..
+    "2) If no run is active, the script stands in the start zone (~30s) to\n" ..
+    "begin it, then pulls the Beehive's 4 switches if needed, clears the kill\n" ..
+    "stages (Duke's: 20/20/25, doubled when enraged) and kills the boss when\n" ..
+    "he spawns. Handles Lord Cublindor / Blazing Jimbee. Status shows progress." })
 
 TabDungeon:CreateSection("Dungeon")
 TabDungeon:CreateDropdown({
@@ -1123,12 +1199,12 @@ TabDungeon:CreateToggle({ Name="Auto Dungeon", CurrentValue=false, Flag="AutoDun
         autoDungeon = v
         if v then
             -- dungeon overrides other farm modes
-            autoQuest = false
-            killAll=false; mineAll=false; chopAll=false
-            selEnemies = {}; selOres = {}; selWood = {}
+            autoQuest = false; autoHarvest = false
+            killAll=false; mineAll=false; chopAll=false; harvestAll=false
+            selEnemies = {}; selOres = {}; selWood = {}; selHarvest = {}
             recompute()
             dungeonBossWasSeen = false
-            dungeonStatus = "starting..."
+            dungeonStatus = "starting — heading to start zone..."
             task.spawn(gotoDungeonSpawn)
         else
             dungeonStatus = "idle"
@@ -1137,22 +1213,18 @@ TabDungeon:CreateToggle({ Name="Auto Dungeon", CurrentValue=false, Flag="AutoDun
 
 TabDungeon:CreateSection("Status")
 local dungeonLabel = TabDungeon:CreateLabel("Status: idle")
-TabDungeon:CreateButton({ Name="Start Dungeon Run (experimental)", Callback=function()
+TabDungeon:CreateButton({ Name="Re-TP to Start Zone", Callback=function()
     task.spawn(function()
-        local r = findRemote("StartDungeon")
-        if not r then dungeonStatus = "StartDungeon remote not found"; return end
-        local area = getDungeonArea()
-        local def = DUNGEONS[dungeonChoice]
-        dungeonStatus = "firing StartDungeon..."
-        -- args weren't captured; try sensible patterns, server ignores bad ones
-        if area then callRemote(r, area) end
-        task.wait(0.4)
-        callRemote(r, dungeonChoice)
-        task.wait(0.4)
-        if def then callRemote(r, def.label) end
-        task.wait(0.4)
-        callRemote(r)
-        dungeonStatus = "StartDungeon fired — if no run starts, SimpleSpy a manual start"
+        local pos = getStartZonePos()
+        if pos then
+            pcall(function()
+                hrp.CFrame = CFrame.new(pos + Vector3.new(0,3,0))
+                hrp.AssemblyLinearVelocity = Vector3.zero
+            end)
+            dungeonStatus = "moved to start zone"
+        else
+            dungeonStatus = "start zone not found"
+        end
     end)
 end })
 task.spawn(function()
@@ -1170,26 +1242,24 @@ end)
 TabQuest:CreateParagraph({ Title="How it works", Content=
     "Pick a quest and hit Accept — the script fires the game's DialogEvent\n" ..
     "(StartQuest) at the right NPC, crawling workspace.NPCs and verifying the\n" ..
-    "quest lands in Player.Quests. Auto-Farm then kills exactly what the\n" ..
-    "quest needs (e.g. the Cubey Bandit chain for the Duke banner). Turn-in\n" ..
-    "tries likely DialogEvent actions and verifies; if none work, SimpleSpy a\n" ..
-    "manual turn-in once and send it. Non-kill requirements are skipped." })
+    "quest lands in Player.Quests. Auto-Farm then does exactly what the quest\n" ..
+    "needs: kills enemies AND harvests bushes (auto-swaps weapon/shears per\n" ..
+    "target). Quests auto-complete and reward themselves once requirements are\n" ..
+    "met — no turn-in needed. Fishing/collect objectives are skipped." })
 
 TabQuest:CreateSection("Control")
 TabQuest:CreateToggle({ Name="Auto-Farm Active Quest Targets", CurrentValue=false, Flag="AutoQuest",
     Callback=function(v)
         autoQuest = v
         if v then
-            autoDungeon = false
-            killAll=false; mineAll=false; chopAll=false
-            selEnemies = {}; selOres = {}; selWood = {}
+            autoDungeon = false; autoHarvest = false
+            killAll=false; mineAll=false; chopAll=false; harvestAll=false
+            selEnemies = {}; selOres = {}; selWood = {}; selHarvest = {}
             autoKill=false; autoOre=false; autoWood=false
         end
     end })
-TabQuest:CreateToggle({ Name="Auto Turn-In completed quests", CurrentValue=false, Flag="AutoTurnIn",
-    Callback=function(v) autoTurnIn = v end })
 
-TabQuest:CreateSection("Accept / Turn In")
+TabQuest:CreateSection("Accept Quest")
 local questOptions = {}
 do
     local defs = RS:FindFirstChild("Quests")
@@ -1208,13 +1278,6 @@ TabQuest:CreateButton({ Name="Accept Selected Quest", Callback=function()
         questActionMsg = "Accepting '" .. tostring(selectedQuest) .. "'..."
         local ok, msg = acceptQuest(selectedQuest)
         questActionMsg = (ok and "Accepted: " or "Accept failed: ") .. tostring(msg)
-    end)
-end })
-TabQuest:CreateButton({ Name="Turn In Selected Quest (tries action names)", Callback=function()
-    task.spawn(function()
-        questActionMsg = "Turning in '" .. tostring(selectedQuest) .. "'..."
-        local ok, msg = tryTurnIn(selectedQuest, false)
-        questActionMsg = (ok and "Turned in: " or "Turn-in failed: ") .. tostring(msg)
     end)
 end })
 local questActionLabel = TabQuest:CreateLabel("Last action: —")

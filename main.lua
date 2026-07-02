@@ -1,5 +1,5 @@
 -- ============================================================
---  Autofarm Script v15 — Auto Harvest + Quest/Dungeon polish
+--  Autofarm Script v16 — Quest Accept Fixed
 -- ============================================================
 -- NEW IN v10:
 --  • FULL enemy list pulled from ReplicatedStorage.Enemies (exact in-game
@@ -750,41 +750,101 @@ local function fireDialog(npc, action, qname)
     pcall(function() DialogEvent:FireServer(npc, action, { QuestName = qname }) end)
 end
 
--- Accept: TP to giver (or crawl all NPCs), fire StartQuest, verify it appears
+-- Accept flow, reworked:
+--  • busy-guarded + cancellable (no more parallel crawls from double presses)
+--  • opens the NPC's dialog first (ProximityPrompt + open-dialog actions),
+--    THEN fires the captured StartQuest — a cold StartQuest is ignored
+--  • default button only tries the KNOWN giver; the all-NPC crawl is a
+--    separate explicit "Find Giver" button
+local questBusy   = false
+local questCancel = false
+local DIALOG_OPEN_ACTIONS = { "StartDialog","Start","Open","Talk","Interact","BeginDialog" }
+
+local function openNPCDialog(npc)
+    -- 1) real route: fire the NPC's talk ProximityPrompt (like the switches)
+    for _, d in ipairs(npc:GetDescendants()) do
+        if d:IsA("ProximityPrompt") then
+            if typeof(fireproximityprompt) == "function" then
+                pcall(function() fireproximityprompt(d) end)
+            else
+                pcall(function()
+                    d.HoldDuration = 0
+                    d:InputHoldBegin(); task.wait(0.1); d:InputHoldEnd()
+                end)
+            end
+            task.wait(0.35)
+            return
+        end
+    end
+    -- 2) fallback: likely open-dialog actions (server ignores wrong ones)
+    for _, act in ipairs(DIALOG_OPEN_ACTIONS) do
+        pcall(function() DialogEvent:FireServer(npc, act) end)
+        task.wait(0.15)
+    end
+end
+
+local function tryAcceptAtNPC(npc, qname)
+    local p = npcPos(npc)
+    if not p then return false end
+    pcall(function()
+        hrp.CFrame = CFrame.new(p + Vector3.new(0, 2, 4), p)
+        hrp.AssemblyLinearVelocity = Vector3.zero
+    end)
+    task.wait(0.3)
+    openNPCDialog(npc)
+    fireDialog(npc, "StartQuest", qname)
+    task.wait(0.5)
+    if questActive(qname) then questNPCCache[qname] = npc; return true end
+    return false
+end
+
+-- Known-giver accept (default button). No crawl.
 local function acceptQuest(qname)
     if questActive(qname) then return true, "already active" end
     if not DialogEvent then return false, "DialogEvent remote not found" end
+    if questBusy then return false, "already working — press Stop first" end
+    questBusy = true; questCancel = false
+    local origin = hrp.CFrame
+    local known = questNPCCache[qname] or questGiverFromDef(qname)
+    local ok, msg
+    if not known then
+        ok, msg = false, "giver unknown — use 'Find Giver (crawl NPCs)'"
+    elseif tryAcceptAtNPC(known, qname) then
+        ok, msg = true, "accepted at " .. known.Name
+    else
+        ok, msg = false, "giver didn't accept — wrong NPC or prerequisites missing"
+    end
+    pcall(function() hrp.CFrame = origin end)
+    questBusy = false
+    return ok, msg
+end
+
+-- Explicit crawl over all NPCs (cancellable), for unknown givers
+local function findGiverAndAccept(qname, statusFn)
+    if questActive(qname) then return true, "already active" end
+    if not DialogEvent then return false, "DialogEvent remote not found" end
+    if questBusy then return false, "already working — press Stop first" end
     local npcs = workspace:FindFirstChild("NPCs")
     if not npcs then return false, "workspace.NPCs not found" end
+    questBusy = true; questCancel = false
     local origin = hrp.CFrame
-
-    local function tryNPC(npc)
-        local p = npcPos(npc)
-        if not p then return false end
-        pcall(function()
-            hrp.CFrame = CFrame.new(p + Vector3.new(0, 3, 3))
-            hrp.AssemblyLinearVelocity = Vector3.zero
-        end)
-        task.wait(0.25)
-        fireDialog(npc, "StartQuest", qname)
-        task.wait(0.45)
-        if questActive(qname) then questNPCCache[qname] = npc; return true end
-        return false
-    end
-
-    local known = questNPCCache[qname] or questGiverFromDef(qname)
-    if known and tryNPC(known) then
-        pcall(function() hrp.CFrame = origin end)
-        return true, "accepted at " .. known.Name
-    end
-    for _, npc in ipairs(npcs:GetChildren()) do
-        if tryNPC(npc) then
+    local list = npcs:GetChildren()
+    for i, npc in ipairs(list) do
+        if questCancel then
             pcall(function() hrp.CFrame = origin end)
+            questBusy = false
+            return false, "stopped"
+        end
+        if statusFn then statusFn(string.format("trying %s (%d/%d)...", npc.Name, i, #list)) end
+        if tryAcceptAtNPC(npc, qname) then
+            pcall(function() hrp.CFrame = origin end)
+            questBusy = false
             return true, "accepted at " .. npc.Name
         end
     end
     pcall(function() hrp.CFrame = origin end)
-    return false, "no NPC accepted it (server may require quest prerequisites)"
+    questBusy = false
+    return false, "no NPC accepted it — capture the full dialog in SimpleSpy"
 end
 
 -- NOTE: quests in Studlands auto-complete and auto-reward the moment their
@@ -1061,7 +1121,7 @@ end)
 -- ══════════════════════════════════════════════════════════
 local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
 local Window = Rayfield:CreateWindow({
-    Name = "Autofarm v15",
+    Name = "Autofarm v16",
     LoadingTitle = "Loading...",
     LoadingSubtitle = "Respawn vs summon tracking",
     ConfigurationSaving = { Enabled = false },
@@ -1080,7 +1140,7 @@ local TabTimers  = Window:CreateTab("Boss Timers")
 local TabExtras  = Window:CreateTab("Extras")
 local TabESP     = Window:CreateTab("Mob ESP")
 
-TabInfo:CreateParagraph({ Title = "v15 — Auto Harvest", Content =
+TabInfo:CreateParagraph({ Title = "v16 — Quest Accept Fixed", Content =
     "NEW: Auto Dungeon tab clears Duke Cublindor's Domain / The Grand Beehive\n" ..
     "(switches, kill stages, boss) hands-free once you're inside. Auto Quest\n" ..
     "tab reads your accepted quests and farms exactly the kills they need.\n" ..
@@ -1240,9 +1300,9 @@ end)
 
 -- ── Auto Quest ─────────────────────────────────────────────
 TabQuest:CreateParagraph({ Title="How it works", Content=
-    "Pick a quest and hit Accept — the script fires the game's DialogEvent\n" ..
-    "(StartQuest) at the right NPC, crawling workspace.NPCs and verifying the\n" ..
-    "quest lands in Player.Quests. Auto-Farm then does exactly what the quest\n" ..
+    "Pick a quest and hit Accept — the script opens the giver's dialog (talk\n" ..
+    "prompt) THEN fires StartQuest, verifying it lands in Player.Quests. If the\n" ..
+    "giver is unknown, use 'Find Giver' (cancellable). Auto-Farm does what the\n" ..
     "needs: kills enemies AND harvests bushes (auto-swaps weapon/shears per\n" ..
     "target). Quests auto-complete and reward themselves once requirements are\n" ..
     "met — no turn-in needed. Fishing/collect objectives are skipped." })
@@ -1273,12 +1333,23 @@ end
 local selectedQuest = questOptions[1]
 TabQuest:CreateDropdown({ Name="Quest", Options=questOptions, CurrentOption={questOptions[1]}, Flag="QuestPick",
     Callback=function(opt) selectedQuest = typeof(opt)=="table" and opt[1] or opt end })
-TabQuest:CreateButton({ Name="Accept Selected Quest", Callback=function()
+TabQuest:CreateButton({ Name="Accept Selected Quest (known giver)", Callback=function()
     task.spawn(function()
         questActionMsg = "Accepting '" .. tostring(selectedQuest) .. "'..."
         local ok, msg = acceptQuest(selectedQuest)
-        questActionMsg = (ok and "Accepted: " or "Accept failed: ") .. tostring(msg)
+        questActionMsg = (ok and "Accepted: " or "Accept: ") .. tostring(msg)
     end)
+end })
+TabQuest:CreateButton({ Name="Find Giver (crawl NPCs) + Accept", Callback=function()
+    task.spawn(function()
+        questActionMsg = "Crawling NPCs for '" .. tostring(selectedQuest) .. "'..."
+        local ok, msg = findGiverAndAccept(selectedQuest, function(s) questActionMsg = s end)
+        questActionMsg = (ok and "Accepted: " or "Accept: ") .. tostring(msg)
+    end)
+end })
+TabQuest:CreateButton({ Name="STOP accept crawl", Callback=function()
+    questCancel = true
+    questActionMsg = "stopping..."
 end })
 local questActionLabel = TabQuest:CreateLabel("Last action: —")
 task.spawn(function()
